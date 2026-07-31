@@ -7,12 +7,15 @@ actor WhisperKitTranscriber: Transcriber {
     /// Forced decode language (e.g. "no" for the NB route). nil → the model's
     /// own default behavior (English-only models don't take a language token).
     private let language: String?
+    /// Optional load-time recorder used by `parrot bench warmup`; nil in normal use.
+    private let recorder: WarmUpRecorder?
     private var pipeline: WhisperKit?
 
-    init(model: TranscriptionModel, language: String? = nil) {
+    init(model: TranscriptionModel, language: String? = nil, recorder: WarmUpRecorder? = nil) {
         self.modelID = model.id
         self.model = model
         self.language = language
+        self.recorder = recorder
     }
 
     /// Loads the model into memory; downloads first if not already on disk.
@@ -32,7 +35,11 @@ actor WhisperKitTranscriber: Transcriber {
             prewarm: true,
             load: true
         )
+        let started = recorder?.now()
         pipeline = try await WhisperKit(config)
+        if let recorder, let started {
+            recorder.record(modelID: model.id, start: started, end: recorder.now())
+        }
         FileHandle.standardError.write(Data("✓ \(model.id) ready\n".utf8))
     }
 

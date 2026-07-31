@@ -8,7 +8,7 @@ struct Parrot: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "parrot",
         abstract: "Minimal macOS dictation daemon. Hold Fn, speak, release.",
-        subcommands: [Run.self, Setup.self, Doctor.self, Models.self, Install.self],
+        subcommands: [Run.self, Setup.self, Doctor.self, Models.self, Install.self, Bench.self],
         defaultSubcommand: Run.self
     )
 }
@@ -220,9 +220,11 @@ struct Run: ParsableCommand {
                             FileHandle.standardError.write(Data(
                                 String(format: "→ %.2fs · %@\n", elapsed, text).utf8
                             ))
-                            var decision: String?
+                            let decision: String?
                             if let routing {
                                 decision = await routing.lastDecision
+                            } else {
+                                decision = nil
                             }
                             await MainActor.run {
                                 TextInjector.inject(text)
