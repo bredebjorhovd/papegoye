@@ -131,7 +131,36 @@ needs headroom.
   overhead ≤ 80 ms p50 over single-model parrot. Per-stage timings (lid /
   decode) are in every route log line.
 - Startup: three warm-ups run concurrently; target ≤ 1.5× the current
-  single-model warm start.
+  single-model warm start. Measured with `parrot bench warmup` (below).
+
+### Measuring warm start
+
+```sh
+parrot bench warmup                    # single-model vs bilingual, 3 iterations each
+parrot bench warmup --only bilingual   # just the three-model set
+parrot bench warmup --json             # machine-readable, for pasting into a ticket
+```
+
+Each iteration builds a *fresh* pipeline set and times `warmUp()`, so nothing
+is cached inside the process between iterations. The first iteration is
+reported as **cold** and the median of the rest as **warm** — only the first
+pays for cold page cache and CoreML compilation. The reported ratio is
+warm ÷ warm, against the 1.5× budget.
+
+"Cold" here means cold-in-process: the OS page cache and CoreML's on-disk
+compilation cache survive between runs. For a cold-from-boot number, `sudo
+purge` first and use `--iterations 1`.
+
+The harness refuses to measure when a model is not on disk — a warm start with
+a download folded into it is not a warm start. It names the missing models and
+the `parrot models download` command to fix it; `--allow-download` overrides.
+
+Because the three loads are supposed to overlap, the bilingual run also reports
+per-model load spans and an overlap efficiency (slowest single load ÷ wall
+clock). At 1.0 the wall clock is just the slowest model; below 0.8 the report
+flags the warm-up as effectively serialized and prints how many seconds were
+lost — the failure mode where the `async let` warm-ups accidentally become a
+chain of awaits.
 
 ## CLI
 
@@ -149,6 +178,8 @@ parrot doctor --bilingual              # checks the bilingual model set is downl
 
 - `swift test --filter RoutingPolicyTests` — table-driven policy tests, no
   audio or models needed.
+- `swift test --filter WarmUpProfileTests` — warm-start analysis: median,
+  ratio vs the 1.5× budget, and the "not overlapping" flag. No models needed.
 - `PARROT_INTEGRATION=1 swift test --filter RoutingIntegrationTests` —
   fixture WAVs → assert route + transcript emptiness; see
   `Tests/fixtures/README.md`. Fixtures are recorded with `--dump-wav`.

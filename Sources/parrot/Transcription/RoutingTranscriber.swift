@@ -14,6 +14,9 @@ import WhisperKit
 /// LID always runs on stock tiny — never on NB-Whisper's own LID head, which
 /// is fine-tuned almost exclusively on Norwegian and skewed accordingly.
 actor RoutingTranscriber: Transcriber {
+    /// Stored rather than computed so it stays nonisolated — the daemon reads
+    /// it synchronously while wiring up the menu bar, before any await point.
+    let modelID: String
     private let configuration: BilingualConfiguration
     private let norwegian: WhisperKitTranscriber
     private let english: WhisperKitTranscriber
@@ -30,18 +33,24 @@ actor RoutingTranscriber: Transcriber {
     /// language rarely changes mid-utterance in dictation.
     private static let lidWindowSamples = Int(30 * AudioCapture.targetSampleRate)
 
-    var modelID: String {
-        "\(configuration.norwegian.id)+\(configuration.english.id)"
-    }
+    /// Optional load-time recorder — set by `parrot bench warmup` to time each
+    /// pipeline and check the three loads really do overlap. nil in normal use.
+    private let recorder: WarmUpRecorder?
 
-    init(configuration: BilingualConfiguration) {
+    init(configuration: BilingualConfiguration, recorder: WarmUpRecorder? = nil) {
+        self.modelID = "\(configuration.norwegian.id)+\(configuration.english.id)"
         self.configuration = configuration
-        self.norwegian = WhisperKitTranscriber(model: configuration.norwegian, language: "no")
+        self.recorder = recorder
+        self.norwegian = WhisperKitTranscriber(
+            model: configuration.norwegian, language: "no", recorder: recorder
+        )
         // English-only models take no language token; only force "en" when the
         // override model is multilingual (else it would re-run its own LID).
         let enLanguage = configuration.english.languages.contains("en")
             && !configuration.english.languages.contains("multi") ? nil : "en"
-        self.english = WhisperKitTranscriber(model: configuration.english, language: enLanguage)
+        self.english = WhisperKitTranscriber(
+            model: configuration.english, language: enLanguage, recorder: recorder
+        )
     }
 
     /// Loads all three pipelines concurrently. Fails atomically: if any model
@@ -136,7 +145,11 @@ actor RoutingTranscriber: Transcriber {
                 prewarm: true,
                 load: true
             )
+            let started = recorder?.now()
             let pipeline = try await WhisperKit(config)
+            if let recorder, let started {
+                recorder.record(modelID: "\(model.id) (lid)", start: started, end: recorder.now())
+            }
             log("✓ \(model.id) ready\n")
             return pipeline
         } catch {
