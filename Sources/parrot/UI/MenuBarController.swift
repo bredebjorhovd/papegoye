@@ -35,8 +35,12 @@ final class MenuBarController {
 
         menu.addItem(.separator())
 
+        // The command stays `parrot` — renaming it would break the LaunchAgent
+        // label, the install path and every merge from upstream. This is the one
+        // place a human reads the name rather than types it, so it gets the
+        // fork's.
         let quit = NSMenuItem(
-            title: "Quit parrot",
+            title: "Quit Papegøye",
             action: #selector(quitClicked),
             keyEquivalent: "q"
         )
