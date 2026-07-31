@@ -75,5 +75,7 @@ for the design). Check items off as they land; add follow-ups at the bottom.
 - [ ] Benchmark FluidAudio/Parakeet v3 (Norwegian-capable) vs NB-Whisper
       (spec open question 3)
 - [ ] Consider tuning `--en-threshold` after real-world use (false-English rate)
-- [ ] Third language route if ever needed — design allows another
-      `(cluster, model)` pair
+- [x] Third language route — design note written up in `docs/bilingual.md`
+      ("Design note: a third route"). Plumbing generalizes; three prerequisites
+      identified (argmax over cleared gates, configurable default route,
+      cluster-disjointness validation). No code change.
