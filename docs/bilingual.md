@@ -47,17 +47,23 @@ question 2: the confidence is available directly, `p = exp(langProbs[lang])`.
 
 ## Routing policy
 
-The policy is a pure function `(language, confidence, duration) → route`
+The policy is a pure function `(LID distribution, duration) → route`
 (`RoutingPolicy.swift`), table-tested in `RoutingPolicyTests`:
 
 - **Norwegian is the default route.** False-English on Norwegian speech is the
   expensive error: NB-Whisper on English is merely degraded, stock English
   Whisper on Norwegian is garbage.
+- Each route is a `Gate` — the languages it claims and the mass that claim must
+  reach. The winner is the **argmax** over the gates that clear, not the first
+  one written; an exact tie takes the default route. Below τ = 0.5 more than
+  one gate can clear, and source order must not be what decides.
 - `en` routes to English only when `p(en) ≥ τ` (default τ = 0.6,
   `--en-threshold`).
 - `no`/`nn`/`da`/`sv` all route to NB-Whisper — Whisper LID frequently
   confuses the Scandinavian languages and NB-Whisper is the right target for
-  all of them in practice. No per-language routes for these.
+  all of them in practice. No per-language routes for these. A gate stands for
+  a model, so the cluster's four languages **pool** their probability instead
+  of competing: `p(no) .3 + p(sv) .2 + p(da) .15` beats `p(en) .4`.
 - Utterances shorter than 0.6 s skip LID entirely → Norwegian. Short
   "ok"/"nei" gives unreliable LID and the routing cost isn't worth it.
 - NB-Whisper's own LID head is never consulted — it is fine-tuned almost
@@ -224,16 +230,25 @@ a route id instead of an enum. `--bilingual` stays as sugar for the NB+EN pair.
 
 ### What has to change, not extend
 
-**1. The if-chain silently depends on source order.** `route()` tests the
-Norwegian cluster, then `en`, then falls through. With one challenger that is
-unambiguous. With two, both can clear their gates at once and whichever is
-written first wins. That looks impossible — LID returns a softmax, so at
-τ ≥ 0.5 only one language can clear — but τ is user-settable and
-`RoutingPolicyTests.testCustomThreshold` already exercises τ = 0.3. So the
-ordering bug is reachable today; it is merely unobservable with one challenger.
-A third route makes it real. The fix is small and should land *with* the third
-route, not after: collect the routes whose gate is cleared, take the argmax of
-`p`, fall back to the default.
+**1. ~~The if-chain silently depends on source order.~~** *Fixed ahead of the
+route — see #18.* `route()` used to test the Norwegian cluster, then `en`, then
+fall through, so whichever branch was written first won when two gates cleared
+at once. That looks impossible — LID returns a softmax, so at τ ≥ 0.5 only one
+language can clear — but τ is user-settable and
+`RoutingPolicyTests.testCustomThreshold` already exercises τ = 0.3.
+
+The branches are now a `[Gate]` table — `(route, languages, threshold)` — and
+`route()` takes the argmax of the mass each gate claims, falling back to
+`defaultRoute` when none clear. A gate stands for a *model*, so it pools the
+whole cluster's probability rather than making `no`/`nn`/`da`/`sv` compete with
+each other. Exact ties go to the default route, and the ordering is total, so
+the table's order carries no meaning at all —
+`testArgmaxOverClearedGatesIgnoresTableOrder` runs every case against the
+table and its reverse. `RoutingTranscriber` now hands the policy the whole
+`langProbs` softmax instead of the top-1 pair, since one probability cannot
+tell you which of two cleared gates cleared by more. At τ ≥ 0.5 that is
+behaviour-preserving (mass ≥ 0.5 *is* the top-1), so only a user-lowered
+`--en-threshold` sees any change. Adding a third route is now typing.
 
 **2. The default route is justified by a pairwise argument.** "Norwegian is the
 safe fallback" rests on a claim about two specific models — NB-Whisper on
@@ -296,9 +311,9 @@ assertion at line 79. Integration fixtures grow by one language's worth.
 
 ## Future
 
-- A third route: see the design note above — the plumbing generalizes, but the
-  argmax fix, the configurable default route, and cluster-disjointness
-  validation are prerequisites, not follow-ups.
+- A third route: see the design note above — the plumbing generalizes, and the
+  argmax fix has landed (#18), but the configurable default route and
+  cluster-disjointness validation are still prerequisites, not follow-ups.
 - Upstream's `Engine` enum already anticipates Parakeet. FluidAudio/Parakeet
   v3 covers European languages including Norwegian; worth benchmarking against
   NB-Whisper before deepening the Whisper-only route (spec open question 3 —
