@@ -54,6 +54,7 @@ parrot --bilingual --en-model whisper-base.en --en-threshold 0.7   # tweak route
 parrot --hotkey right-option           # change the push-to-talk key
 parrot --no-overlay                    # disable the bottom-of-screen pill
 parrot bench warmup                    # time single-model vs bilingual startup
+parrot bench lid                       # time language detection across utterance lengths
 ```
 
 ## Stack

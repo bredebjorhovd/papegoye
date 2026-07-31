@@ -1,10 +1,11 @@
 import ArgumentParser
 import Foundation
+import WhisperKit
 
 struct Bench: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Measure startup and routing costs.",
-        subcommands: [WarmUp.self]
+        subcommands: [WarmUp.self, LID.self]
     )
 
     /// Warm-start harness for spec §7: is the three-model bilingual warm start
@@ -103,7 +104,7 @@ struct Bench: ParsableCommand {
             }
 
             let iterations = self.iterations
-            let box = OutcomeBox()
+            let box = ResultBox<(WarmStartMeasurement?, WarmStartMeasurement?)>()
             let semaphore = DispatchSemaphore(value: 0)
             Task.detached {
                 do {
@@ -195,23 +196,276 @@ struct Bench: ParsableCommand {
             return ExitCode(1)
         }
     }
+
+    /// LID latency harness for spec §7: is the language-identification pass
+    /// within its 30 ms budget, and does its cost track the utterance or the
+    /// model's fixed input window? (gh#20 — measured LID is 66-89 ms warm.)
+    ///
+    /// LID latency depends on how much audio the model is handed, not on what
+    /// the audio says, so the sweep runs on generated signals: no microphone,
+    /// no fixtures, no Norwegian speaker. That also bounds what it can answer
+    /// — it measures latency, never accuracy.
+    struct LID: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            commandName: "lid",
+            abstract: "Time the language-identification pass across utterance lengths."
+        )
+
+        @Option(name: .long, help: "Utterance lengths in seconds, comma-separated.")
+        var durations: String = "1,2,5,10,30"
+
+        @Option(name: .long, help: "Synthetic signals to time: silence, noise, tone, or all.")
+        var signals: String = "noise"
+
+        @Option(name: .long, help: "Timed calls per cell. One cold call is timed separately, before the sweep.")
+        var iterations: Int = 5
+
+        @Option(name: .customLong("lid-model"), help: "Model used for the LID pass.")
+        var lidModel: String = BilingualConfiguration.lidModelID
+
+        @Flag(name: .long, help: "Also split each call into pad / mel / encoder / decode.")
+        var stages: Bool = false
+
+        @Flag(name: .long, help: "Measure even if the model still has to be downloaded.")
+        var allowDownload: Bool = false
+
+        @Flag(name: .long, help: "Emit machine-readable JSON instead of the text report.")
+        var json: Bool = false
+
+        func validate() throws {
+            if iterations < 1 {
+                throw ValidationError("--iterations must be at least 1.")
+            }
+            do {
+                _ = try LIDSweepInput.durations(durations)
+                _ = try LIDSweepInput.signals(signals)
+            } catch let error as LIDSweepInput.ParseError {
+                throw ValidationError(error.description)
+            }
+        }
+
+        func run() throws {
+            guard let model = ModelRegistry.find(lidModel) else {
+                throw fail("unknown model: \(lidModel) — run `parrot models list --all` to see options.")
+            }
+            guard model.languages.contains("multi") else {
+                throw fail("\(model.id) is not multilingual — language detection needs a "
+                    + "multilingual model (the default is \(BilingualConfiguration.lidModelID)).")
+            }
+            if !Bench.WarmUp.notDownloaded([model]).isEmpty, !allowDownload {
+                throw fail("not measured — \(model.id) is not on disk.\n"
+                    + "  → parrot models download \(model.id)\n"
+                    + "pass --allow-download to download it as part of the run.")
+            }
+
+            let lengths = try LIDSweepInput.durations(durations)
+            let signalSet = try LIDSweepInput.signals(signals)
+            let iterations = self.iterations
+            let withStages = stages
+            let box = ResultBox<LIDMeasurement>()
+            let semaphore = DispatchSemaphore(value: 0)
+            Task.detached {
+                do {
+                    box.set(.success(try await Self.sweep(
+                        model: model, lengths: lengths, signals: signalSet,
+                        iterations: iterations, stages: withStages
+                    )))
+                } catch {
+                    box.set(.failure(error))
+                }
+                semaphore.signal()
+            }
+            semaphore.wait()
+
+            switch box.get() {
+            case let .failure(error):
+                throw fail("lid bench failed: \(error)")
+            case let .success(measurement):
+                print(json ? LIDReport.json(measurement) : LIDReport.text(measurement))
+            case .none:
+                throw fail("lid bench produced no result")
+            }
+        }
+
+        /// Loads the LID pipeline once, pays the cold call once, then times
+        /// every (signal, length) cell against the same warm pipeline — the
+        /// state the daemon is in for every utterance after the first.
+        private static func sweep(
+            model: TranscriptionModel,
+            lengths: [Double],
+            signals: [SyntheticAudio.Signal],
+            iterations: Int,
+            stages: Bool
+        ) async throws -> LIDMeasurement {
+            let pipeline = try await LIDPipeline.load(model)
+
+            // The first call after load pays for lazy CoreML setup — the 803 ms
+            // outlier in the gh#20 session log. Timed once, reported once, and
+            // kept out of every cell.
+            let longest = lengths.max() ?? 30
+            let cold = try await time {
+                _ = try await pipeline.detectLangauge(
+                    audioArray: SyntheticAudio.make(.noise, seconds: longest)
+                )
+            }
+            FileHandle.standardError.write(Data(String(format: "◐ lid cold · %.1fms\n", cold).utf8))
+
+            var cells: [LIDCell] = []
+            for signal in signals {
+                for seconds in lengths {
+                    let audio = SyntheticAudio.make(signal, seconds: seconds)
+                    var millis: [Double] = []
+                    var detected: String?
+                    for _ in 0..<iterations {
+                        let elapsed = try await time {
+                            detected = try await pipeline.detectLangauge(audioArray: audio).language
+                        }
+                        millis.append(elapsed)
+                    }
+                    let cell = LIDCell(
+                        signal: signal.rawValue,
+                        seconds: seconds,
+                        sampleCount: audio.count,
+                        millis: millis,
+                        detectedLanguage: detected
+                    )
+                    cells.append(cell)
+                    FileHandle.standardError.write(Data(String(
+                        format: "◐ lid %@ %.1fs · median %.1fms (%d calls)\n",
+                        signal.rawValue, seconds, cell.median, millis.count
+                    ).utf8))
+                }
+            }
+
+            var breakdowns: [LIDStageBreakdown] = []
+            if stages {
+                for seconds in lengths {
+                    breakdowns.append(try await stageBreakdown(
+                        pipeline: pipeline,
+                        signal: signals.first ?? .noise,
+                        seconds: seconds,
+                        iterations: iterations
+                    ))
+                }
+            }
+
+            return LIDMeasurement(
+                modelID: model.id,
+                sampleRate: AudioCapture.targetSampleRate,
+                windowSamples: pipeline.featureExtractor.windowSamples,
+                coldMillis: cold,
+                cells: cells,
+                stages: breakdowns,
+                optimizedBuild: optimizedBuild
+            )
+        }
+
+        /// Times `detectLangauge`'s own stages — pad, mel, encoder — through
+        /// the same public pipeline objects the real call uses, plus a full
+        /// call for the residual. Reproduces `WhisperKit.detectLangauge`'s
+        /// prologue exactly: pad or trim to the feature extractor's window,
+        /// mel, encode.
+        private static func stageBreakdown(
+            pipeline: WhisperKit,
+            signal: SyntheticAudio.Signal,
+            seconds: Double,
+            iterations: Int
+        ) async throws -> LIDStageBreakdown {
+            let audio = SyntheticAudio.make(signal, seconds: seconds)
+            // Same fallback WhisperKit uses when the model does not declare one.
+            let window = pipeline.featureExtractor.windowSamples ?? 480_000
+            var pad: [Double] = []
+            var mel: [Double] = []
+            var encode: [Double] = []
+            var total: [Double] = []
+            for _ in 0..<iterations {
+                var padded: (any AudioProcessorOutputType)?
+                pad.append(await time {
+                    padded = pipeline.audioProcessor.padOrTrim(
+                        fromArray: audio, startAt: 0, toLength: window
+                    )
+                })
+                guard let padded else {
+                    throw LIDBenchError.stageFailed("padOrTrim returned nothing")
+                }
+                var features: (any FeatureExtractorOutputType)?
+                mel.append(try await time {
+                    features = try await pipeline.featureExtractor.logMelSpectrogram(fromAudio: padded)
+                })
+                guard let features else {
+                    throw LIDBenchError.stageFailed("mel spectrogram returned nothing")
+                }
+                encode.append(try await time {
+                    _ = try await pipeline.audioEncoder.encodeFeatures(features)
+                })
+                total.append(try await time {
+                    _ = try await pipeline.detectLangauge(audioArray: audio)
+                })
+            }
+            let breakdown = LIDStageBreakdown(
+                seconds: seconds, padMillis: pad, melMillis: mel,
+                encodeMillis: encode, totalMillis: total
+            )
+            FileHandle.standardError.write(Data(String(
+                format: "◐ lid stages %.1fs · pad %.1f · mel %.1f · encode %.1f · total %.1fms\n",
+                seconds, breakdown.pad, breakdown.mel, breakdown.encode, breakdown.total
+            ).utf8))
+            return breakdown
+        }
+
+        /// Whether this binary was compiled with optimization. `swift run` and
+        /// `swift build` produce a debug binary, where the Swift half of the
+        /// LID call costs several times what it does in a release build — the
+        /// difference between failing and meeting the budget, so the report
+        /// says which one it measured.
+        private static var optimizedBuild: Bool {
+            #if DEBUG
+            return false
+            #else
+            return true
+            #endif
+        }
+
+        /// Milliseconds on the monotonic clock — `Date` can step under NTP and
+        /// these spans are tens of milliseconds.
+        private static func time(_ body: () async throws -> Void) async rethrows -> Double {
+            let started = DispatchTime.now().uptimeNanoseconds
+            try await body()
+            return Double(DispatchTime.now().uptimeNanoseconds &- started) / 1e6
+        }
+
+        private func fail(_ message: String) -> ExitCode {
+            FileHandle.standardError.write(Data("\(message)\n".utf8))
+            return ExitCode(1)
+        }
+    }
+}
+
+enum LIDBenchError: Error, CustomStringConvertible {
+    /// A stage of the hand-rolled `detectLangauge` breakdown returned nothing.
+    case stageFailed(String)
+
+    var description: String {
+        switch self {
+        case let .stageFailed(what):
+            return "stage breakdown failed: \(what)"
+        }
+    }
 }
 
 /// Carries the async result back to ParsableCommand's synchronous `run()`
 /// without capturing a mutable variable across a concurrency boundary.
-private final class OutcomeBox: @unchecked Sendable {
-    typealias Value = Result<(WarmStartMeasurement?, WarmStartMeasurement?), Error>
-
+private final class ResultBox<Value>: @unchecked Sendable {
     private let lock = NSLock()
-    private var value: Value?
+    private var value: Result<Value, Error>?
 
-    func set(_ newValue: Value) {
+    func set(_ newValue: Result<Value, Error>) {
         lock.lock()
         defer { lock.unlock() }
         value = newValue
     }
 
-    func get() -> Value? {
+    func get() -> Result<Value, Error>? {
         lock.lock()
         defer { lock.unlock() }
         return value

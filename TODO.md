@@ -30,6 +30,12 @@ for the design). Check items off as they land; add follow-ups at the bottom.
   - [x] `WarmUpProfileTests` — overlap analysis, median, ratio, report verdicts
   - [x] Refuses to measure when a model is missing (names it) — no warm start
         with a download folded into it
+- [x] `parrot bench lid` — LID latency harness (gh#20): synthetic audio at
+      several lengths, fixed-cost vs tracks-length verdict, optional pad / mel /
+      encoder / decode split, budget verdict, JSON. No mic or fixtures needed.
+  - [x] `LIDProfileTests` — signal generation, scaling verdict, budget scope,
+        debug-build warning
+  - [x] Reports which build it measured; refuses to call a debug run a verdict
 - [x] Opt-in integration test scaffold (`PARROT_INTEGRATION=1`) + fixtures README
 - [x] `scripts/convert-nb-whisper.sh` (convert, sanity-check layout, optional HF upload)
 - [x] Docs: `docs/bilingual.md`, README + architecture updates
@@ -66,6 +72,15 @@ for the design). Check items off as they land; add follow-ups at the bottom.
 - [ ] Manual: 20 mixed utterances into a text field — ≥ 18 routed correctly,
       **zero** stock-Whisper-on-Norwegian outputs
 - [ ] Latency: LID ≤ 30 ms on ANE for ≤ 10 s utterance (read from `◐ lid` logs)
+      — **still open, but the 66-89 ms that opened gh#20 does not reproduce.**
+      `parrot bench lid --durations 1,2,5,10,30 --signals all --stages`
+      (2026-07-31): release build **15.4 ms median, PASS**; the same sweep from
+      a `swift build` debug binary gives ~52 ms, FAIL. The CoreML encoder costs
+      6.1-6.2 ms in both — only the Swift half of the call changes. Latency is
+      a fixed cost (1.17× spread over 30× utterance length), so a shorter LID
+      window buys nothing: WhisperKit pads back to the model's own 30 s window.
+      Default window left unchanged. Closing this needs a live release-build
+      run with a microphone, plus powermetrics for the "on ANE" half.
 - [ ] Latency: total routing overhead ≤ 80 ms p50 vs single-model parrot
 - [x] Startup: three-model warm start ≤ 1.5× current single-model warm start —
       **1.11×, PASS** (`parrot bench warmup --iterations 3`, 2026-07-31).
@@ -82,6 +97,12 @@ for the design). Check items off as they land; add follow-ups at the bottom.
 ## Later / open
 
 - [ ] Evaluate `nb-whisper-*-distil` variants if latency needs headroom
+- [ ] LID accuracy vs window length — **not worth running as things stand.**
+      gh#20 asked for it before proposing a shorter `lidWindowSamples`, but a
+      shorter window has no latency to buy: WhisperKit pads every LID input
+      back up to the model's own 30 s mel window. The experiment only becomes
+      meaningful if someone converts a short-window mel + encoder pair, and it
+      would then need labelled Norwegian/English speech, not synthetic audio.
 - [ ] Benchmark FluidAudio/Parakeet v3 (Norwegian-capable) vs NB-Whisper
       (spec open question 3)
 - [ ] Consider tuning `--en-threshold` after real-world use (false-English rate)
