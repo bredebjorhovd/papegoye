@@ -8,9 +8,12 @@ final class MenuBarController {
     private let statusItem: NSStatusItem
     private let modelLabel: NSMenuItem
     private let stateLabel: NSMenuItem
+    private let routeLabel: NSMenuItem
     private let modelID: String
 
-    init(modelID: String) {
+    /// `buttonTitle` puts a short text label next to the bird icon — used by
+    /// bilingual mode to show the active pair, e.g. "nb-small+en-small".
+    init(modelID: String, buttonTitle: String? = nil) {
         self.modelID = modelID
         self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
 
@@ -25,6 +28,11 @@ final class MenuBarController {
         modelLabel.isEnabled = false
         menu.addItem(modelLabel)
 
+        routeLabel = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+        routeLabel.isEnabled = false
+        routeLabel.isHidden = true
+        menu.addItem(routeLabel)
+
         menu.addItem(.separator())
 
         let quit = NSMenuItem(
@@ -36,7 +44,7 @@ final class MenuBarController {
         menu.addItem(quit)
 
         statusItem.menu = menu
-        configureButton(recording: false)
+        configureButton(recording: false, title: buttonTitle)
     }
 
     func setRecording(_ recording: Bool) {
@@ -47,11 +55,22 @@ final class MenuBarController {
         stateLabel.title = "transcribing…"
     }
 
-    private func configureButton(recording: Bool) {
+    /// Show the last routing decision (bilingual mode), e.g. "no→no 0.94 · 12ms".
+    func setLastDecision(_ text: String) {
+        routeLabel.title = "last route: \(text)"
+        routeLabel.isHidden = false
+    }
+
+    private func configureButton(recording: Bool, title: String? = nil) {
         guard let button = statusItem.button else { return }
         let image = Self.birdImage()
         image?.isTemplate = true
         button.image = image
+        if let title {
+            button.title = " \(title)"
+            button.imagePosition = .imageLeft
+            button.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        }
     }
 
     // Inlined Lucide bird SVG. Keeping it in source means the executable has

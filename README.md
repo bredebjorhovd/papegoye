@@ -1,6 +1,18 @@
-# parrot
+# parrot (papegøye fork)
 
 A minimal macOS dictation daemon. Push-to-talk, on-device transcription, text inserted at the cursor.
+
+This fork adds **bilingual Norwegian/English dictation**: hold Fn, speak either
+language, and each utterance is routed automatically to
+[NB-Whisper](https://huggingface.co/NbAiLab) (Norwegian) or stock Whisper
+(English) via a fast language-identification pass on multilingual tiny.
+
+```sh
+parrot --bilingual
+```
+
+See [docs/bilingual.md](docs/bilingual.md) for the design, routing policy, and
+NB-Whisper → CoreML conversion.
 
 ## Install
 
@@ -35,7 +47,10 @@ parrot install --uninstall             # remove the LaunchAgent
 parrot doctor                          # check permissions + fn key setting
 parrot models list                     # list available models
 parrot models download <id>            # pre-download a model
+parrot models download bilingual       # pre-download the bilingual model set
 parrot --model whisper-large-v3-turbo  # bigger, multilingual, slower first-run
+parrot --bilingual                     # per-utterance Norwegian/English routing
+parrot --bilingual --en-model whisper-base.en --en-threshold 0.7   # tweak routes
 parrot --hotkey right-option           # change the push-to-talk key
 parrot --no-overlay                    # disable the bottom-of-screen pill
 ```

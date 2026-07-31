@@ -4,11 +4,15 @@ import WhisperKit
 actor WhisperKitTranscriber: Transcriber {
     let modelID: String
     private let model: TranscriptionModel
+    /// Forced decode language (e.g. "no" for the NB route). nil → the model's
+    /// own default behavior (English-only models don't take a language token).
+    private let language: String?
     private var pipeline: WhisperKit?
 
-    init(model: TranscriptionModel) {
+    init(model: TranscriptionModel, language: String? = nil) {
         self.modelID = model.id
         self.model = model
+        self.language = language
     }
 
     /// Loads the model into memory; downloads first if not already on disk.
@@ -20,7 +24,14 @@ actor WhisperKitTranscriber: Transcriber {
             throw TranscriberError.missingEngineID
         }
         FileHandle.standardError.write(Data("loading \(model.id)...\n".utf8))
-        let config = WhisperKitConfig(model: whisperKitID, verbose: false, prewarm: true, load: true)
+        let config = WhisperKitConfig(
+            model: whisperKitID,
+            modelRepo: model.modelRepo,
+            modelFolder: model.modelFolder,
+            verbose: false,
+            prewarm: true,
+            load: true
+        )
         pipeline = try await WhisperKit(config)
         FileHandle.standardError.write(Data("✓ \(model.id) ready\n".utf8))
     }
@@ -29,7 +40,16 @@ actor WhisperKitTranscriber: Transcriber {
         if pipeline == nil { try await warmUp() }
         guard let pipeline else { throw TranscriberError.notLoaded }
 
-        let results = try await pipeline.transcribe(audioArray: audio)
+        var options: DecodingOptions?
+        if let language {
+            options = DecodingOptions(
+                task: .transcribe,
+                language: language,
+                temperature: 0,
+                detectLanguage: false
+            )
+        }
+        let results = try await pipeline.transcribe(audioArray: audio, decodeOptions: options)
         let raw = results.map(\.text).joined(separator: " ")
         return Self.sanitize(raw)
     }
@@ -37,6 +57,8 @@ actor WhisperKitTranscriber: Transcriber {
     /// Strip Whisper's non-speech bracket tokens ([BLANK_AUDIO], [MUSIC],
     /// (silence), <|nospeech|>, etc.) and collapse whitespace. When the model
     /// hears silence it emits these literally; we don't want to paste them.
+    /// NB-Whisper emits the same bracket-token families on silence, so the
+    /// same patterns cover both routes; extend here if new markers show up.
     static func sanitize(_ text: String) -> String {
         let patterns = [
             #"\[[^\]]*\]"#,        // [BLANK_AUDIO], [MUSIC], [Applause]

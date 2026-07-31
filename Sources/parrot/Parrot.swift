@@ -19,6 +19,10 @@ struct Run: ParsableCommand {
         abstract: "Run the daemon (default)."
     )
 
+    /// Captures with RMS below this are treated as silence/noise-only and
+    /// skipped before LID — language detection on silence is meaningless.
+    static let silenceRMSFloor: Float = 0.003
+
     @Flag(name: .long, help: "Skip permission checks at startup.")
     var skipDoctor: Bool = false
 
@@ -34,9 +38,89 @@ struct Run: ParsableCommand {
     @Option(name: .long, help: "Model id to use. Defaults to the recommended model.")
     var model: String?
 
+    @Flag(name: .long, help: "Bilingual mode: route each utterance to NB-Whisper (Norwegian) or English Whisper via language detection.")
+    var bilingual: Bool = false
+
+    @Option(name: .customLong("no-model"), help: "Bilingual: model for the Norwegian route.")
+    var noModel: String = BilingualConfiguration.defaultNorwegianModelID
+
+    @Option(name: .customLong("en-model"), help: "Bilingual: model for the English route.")
+    var enModel: String = BilingualConfiguration.defaultEnglishModelID
+
+    @Option(name: .customLong("en-threshold"), help: "Bilingual: LID confidence gate for the English route (0-1).")
+    var enThreshold: Float = RoutingPolicy.defaultEnglishThreshold
+
+    func validate() throws {
+        if bilingual, model != nil {
+            throw ValidationError("--model conflicts with --bilingual; use --no-model / --en-model instead.")
+        }
+        if !bilingual {
+            if noModel != BilingualConfiguration.defaultNorwegianModelID
+                || enModel != BilingualConfiguration.defaultEnglishModelID
+                || enThreshold != RoutingPolicy.defaultEnglishThreshold
+            {
+                throw ValidationError("--no-model / --en-model / --en-threshold require --bilingual.")
+            }
+        }
+        if bilingual, !(0...1).contains(enThreshold) {
+            throw ValidationError("--en-threshold must be between 0 and 1.")
+        }
+    }
+
     func run() throws {
+        // Resolve models first so doctor can check they're downloaded.
+        let transcriber: any Transcriber
+        let routing: RoutingTranscriber?
+        let activeModels: [TranscriptionModel]
+        let menuBarModelID: String
+        let menuBarTitle: String?
+        let silenceFloor: Float?
+
+        if bilingual {
+            let config: BilingualConfiguration
+            do {
+                config = try BilingualConfiguration(
+                    norwegianModelID: noModel,
+                    englishModelID: enModel,
+                    englishThreshold: enThreshold
+                )
+            } catch {
+                FileHandle.standardError.write(Data("\(error)\n".utf8))
+                throw ExitCode(1)
+            }
+            let r = RoutingTranscriber(configuration: config)
+            transcriber = r
+            routing = r
+            activeModels = config.models
+            menuBarModelID = r.modelID
+            menuBarTitle = config.shortLabel
+            silenceFloor = Self.silenceRMSFloor
+        } else {
+            let chosenModel: TranscriptionModel
+            if let id = model {
+                guard let m = ModelRegistry.find(id) else {
+                    FileHandle.standardError.write(Data("unknown model: \(id)\n".utf8))
+                    FileHandle.standardError.write(Data("run `parrot models list` to see options.\n".utf8))
+                    throw ExitCode(1)
+                }
+                chosenModel = m
+            } else {
+                guard let m = ModelRegistry.recommended() else {
+                    FileHandle.standardError.write(Data("no models registered\n".utf8))
+                    throw ExitCode(1)
+                }
+                chosenModel = m
+            }
+            transcriber = WhisperKitTranscriber(model: chosenModel)
+            routing = nil
+            activeModels = [chosenModel]
+            menuBarModelID = chosenModel.id
+            menuBarTitle = nil
+            silenceFloor = nil
+        }
+
         if !skipDoctor {
-            let checks = DoctorReport.run()
+            let checks = DoctorReport.run(models: activeModels)
             if !DoctorReport.allOK(checks) {
                 FileHandle.standardError.write(Data("startup checks failed:\n".utf8))
                 DoctorReport.print(checks)
@@ -45,23 +129,6 @@ struct Run: ParsableCommand {
             }
         }
 
-        let chosenModel: TranscriptionModel
-        if let id = model {
-            guard let m = ModelRegistry.find(id) else {
-                FileHandle.standardError.write(Data("unknown model: \(id)\n".utf8))
-                FileHandle.standardError.write(Data("run `parrot models list` to see options.\n".utf8))
-                throw ExitCode(1)
-            }
-            chosenModel = m
-        } else {
-            guard let m = ModelRegistry.recommended() else {
-                FileHandle.standardError.write(Data("no models registered\n".utf8))
-                throw ExitCode(1)
-            }
-            chosenModel = m
-        }
-
-        let transcriber = WhisperKitTranscriber(model: chosenModel)
         let warmupSemaphore = DispatchSemaphore(value: 0)
         var warmupError: Error?
         Task.detached {
@@ -88,7 +155,9 @@ struct Run: ParsableCommand {
         if let overlay {
             capture.onLevel = { level in overlay.pushLevel(level) }
         }
-        let menuBar = MainActor.assumeIsolated { MenuBarController(modelID: chosenModel.id) }
+        let menuBar = MainActor.assumeIsolated {
+            MenuBarController(modelID: menuBarModelID, buttonTitle: menuBarTitle)
+        }
 
         do {
             try monitor.start { event in
@@ -131,6 +200,18 @@ struct Run: ParsableCommand {
                         }
                         return
                     }
+                    // Silence gate: LID on noise-only captures is meaningless,
+                    // and there is nothing worth decoding either.
+                    if let silenceFloor, rms < silenceFloor {
+                        FileHandle.standardError.write(Data(
+                            String(format: "∅ silence (rms %.3f < %.3f) · skipped\n", rms, silenceFloor).utf8
+                        ))
+                        MainActor.assumeIsolated {
+                            overlay?.hide()
+                            menuBar.setRecording(false)
+                        }
+                        return
+                    }
                     Task {
                         let started = Date()
                         do {
@@ -139,10 +220,17 @@ struct Run: ParsableCommand {
                             FileHandle.standardError.write(Data(
                                 String(format: "→ %.2fs · %@\n", elapsed, text).utf8
                             ))
+                            var decision: String?
+                            if let routing {
+                                decision = await routing.lastDecision
+                            }
                             await MainActor.run {
                                 TextInjector.inject(text)
                                 overlay?.hide()
                                 menuBar.setRecording(false)
+                                if let decision {
+                                    menuBar.setLastDecision(decision)
+                                }
                             }
                         } catch {
                             FileHandle.standardError.write(Data("transcription failed: \(error)\n".utf8))
@@ -169,7 +257,7 @@ struct Run: ParsableCommand {
         sigint.resume()
         signal(SIGINT, SIG_IGN)
 
-        FileHandle.standardError.write(Data("listening on fn hold · model: \(chosenModel.id) · ^C to quit\n".utf8))
+        FileHandle.standardError.write(Data("listening on fn hold · model: \(menuBarModelID) · ^C to quit\n".utf8))
         app.run()
     }
 }
@@ -179,8 +267,31 @@ struct Doctor: ParsableCommand {
         abstract: "Check microphone, accessibility, and Fn key configuration."
     )
 
+    @Flag(name: .long, help: "Also check that the bilingual model set is downloaded.")
+    var bilingual: Bool = false
+
+    @Option(name: .long, help: "Also check that this model is downloaded.")
+    var model: String?
+
     func run() throws {
-        let checks = DoctorReport.run()
+        var models: [TranscriptionModel] = []
+        if bilingual {
+            do {
+                models = try BilingualConfiguration().models
+            } catch {
+                FileHandle.standardError.write(Data("\(error)\n".utf8))
+                throw ExitCode(1)
+            }
+        } else if let id = model {
+            guard let m = ModelRegistry.find(id) else {
+                FileHandle.standardError.write(Data("unknown model: \(id)\n".utf8))
+                throw ExitCode(1)
+            }
+            models = [m]
+        } else if let m = ModelRegistry.recommended() {
+            models = [m]
+        }
+        let checks = DoctorReport.run(models: models)
         DoctorReport.print(checks)
         if !DoctorReport.allOK(checks) {
             throw ExitCode(1)
@@ -195,8 +306,11 @@ struct Models: ParsableCommand {
     )
 
     struct List: ParsableCommand {
+        @Flag(name: .long, help: "Include hidden/internal models (e.g. the LID model).")
+        var all: Bool = false
+
         func run() throws {
-            for m in ModelRegistry.shared {
+            for m in ModelRegistry.shared where all || !m.hidden {
                 let star = m.recommended ? "★" : " "
                 let id = m.id.padding(toLength: 26, withPad: " ", startingAt: 0)
                 let langs = "[\(m.languages.joined(separator: ","))]"
@@ -208,19 +322,35 @@ struct Models: ParsableCommand {
     }
 
     struct Download: ParsableCommand {
-        @Argument(help: "Model id to download.") var id: String
+        @Argument(help: "Model id to download, or 'bilingual' for the full bilingual set.")
+        var id: String
 
         func run() throws {
-            guard let m = ModelRegistry.find(id) else {
+            let models: [TranscriptionModel]
+            if id == "bilingual" || id == "bilingual-nb-en" {
+                do {
+                    models = try BilingualConfiguration().models
+                } catch {
+                    print("\(error)")
+                    throw ExitCode(1)
+                }
+            } else if let m = ModelRegistry.find(id) {
+                models = [m]
+            } else {
                 print("unknown model: \(id)")
                 throw ExitCode(1)
             }
-            let t = WhisperKitTranscriber(model: m)
 
             let sem = DispatchSemaphore(value: 0)
             var capturedError: Error?
             Task.detached {
-                do { try await t.warmUp() } catch { capturedError = error }
+                do {
+                    for m in models {
+                        try await WhisperKitTranscriber(model: m).warmUp()
+                    }
+                } catch {
+                    capturedError = error
+                }
                 sem.signal()
             }
             sem.wait()

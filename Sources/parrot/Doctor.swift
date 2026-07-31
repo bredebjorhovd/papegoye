@@ -16,12 +16,64 @@ struct Check {
 }
 
 enum DoctorReport {
-    static func run() -> [Check] {
-        [
+    /// `models` — the active configuration's model set (three in bilingual
+    /// mode). Missing downloads are a warning, not a failure: warmup will
+    /// download them, but on a slow link you'd rather know up front.
+    static func run(models: [TranscriptionModel] = []) -> [Check] {
+        var checks = [
             checkMicrophone(),
             checkAccessibility(),
             checkFnKeyMapping(),
         ]
+        for m in models {
+            checks.append(checkModelDownloaded(m))
+        }
+        return checks
+    }
+
+    /// WhisperKit (via swift-transformers' HubApi) downloads models to
+    /// ~/Documents/huggingface/models/<repo>/<variant>. A model with an
+    /// explicit `modelFolder` is checked at that path instead.
+    static func checkModelDownloaded(_ model: TranscriptionModel) -> Check {
+        let name = "model \(model.id)"
+        if let folder = model.modelFolder {
+            if directoryNonEmpty(folder) {
+                return Check(name: name, status: .ok, remediation: nil)
+            }
+            return Check(
+                name: name,
+                status: .fail("local model folder missing: \(folder)"),
+                remediation: "check the path, or unset it to download from HF instead"
+            )
+        }
+        guard let variant = model.whisperKitID else {
+            return Check(name: name, status: .fail("no engine id"), remediation: nil)
+        }
+        let repo = model.modelRepo ?? "argmaxinc/whisperkit-coreml"
+        let repoDir = FileManager.default
+            .urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("huggingface/models/\(repo)")
+        // WhisperKit fuzzy-matches variant folder names on download, so
+        // accept any non-empty folder whose name contains the variant.
+        let candidates = (try? FileManager.default.contentsOfDirectory(atPath: repoDir.path)) ?? []
+        let found = candidates.contains { $0.contains(variant) && directoryNonEmpty(repoDir.appendingPathComponent($0).path) }
+        if found {
+            return Check(name: name, status: .ok, remediation: nil)
+        }
+        return Check(
+            name: name,
+            status: .warn("not downloaded — will download on first run"),
+            remediation: "pre-fetch with `parrot models download \(model.id)`"
+        )
+    }
+
+    private static func directoryNonEmpty(_ path: String) -> Bool {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
+            return false
+        }
+        let contents = (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []
+        return !contents.isEmpty
     }
 
     static func checkMicrophone() -> Check {

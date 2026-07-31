@@ -95,6 +95,7 @@ protocol Transcriber {
 Concrete implementations:
 
 - `WhisperKitTranscriber` — wraps the `WhisperKit` package. CoreML, ANE-accelerated.
+- `RoutingTranscriber` — bilingual Norwegian/English router: a tiny-model LID pass dispatches each utterance to NB-Whisper or English Whisper. See [bilingual.md](bilingual.md).
 - `ParakeetTranscriber` — wraps `FluidAudio` (or direct CoreML) for NVIDIA Parakeet TDT.
 
 Adding an engine = one new file conforming to `Transcriber`.
