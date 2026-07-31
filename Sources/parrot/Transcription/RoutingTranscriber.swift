@@ -75,6 +75,10 @@ actor RoutingTranscriber: Transcriber {
 
         var language: String?
         var probability: Float?
+        // The whole softmax, not just the top-1 entry: below τ = 0.5 more than
+        // one route can clear its gate, and the policy needs every route's mass
+        // to say which cleared it by more.
+        var distribution: [String: Float] = [:]
         var lidMillis = 0
 
         if policy.shouldRunLID(seconds: seconds) {
@@ -87,11 +91,10 @@ actor RoutingTranscriber: Transcriber {
                 let detection = try await lidPipeline.detectLangauge(audioArray: window)
                 lidMillis = Int(Date().timeIntervalSince(started) * 1000)
                 language = detection.language
-                // langProbs carries the log-probability of the sampled
-                // language token (softmax over the <|lang|> distribution).
-                if let logProb = detection.langProbs[detection.language] {
-                    probability = exp(logProb)
-                }
+                // langProbs carries log-probabilities of the language tokens
+                // (softmax over the <|lang|> distribution).
+                distribution = detection.langProbs.mapValues { exp($0) }
+                probability = distribution[detection.language]
                 log(String(format: "◐ lid %@ %.2f · %dms\n",
                            detection.language, probability ?? 0, lidMillis))
             } catch {
@@ -101,10 +104,10 @@ actor RoutingTranscriber: Transcriber {
             }
         } else {
             log(String(format: "◐ lid skip (%.2fs < %.1fs) → %@\n",
-                       seconds, policy.minLIDSeconds, Route.norwegian.rawValue))
+                       seconds, policy.minLIDSeconds, policy.defaultRoute.rawValue))
         }
 
-        let route = policy.route(language: language, probability: probability, seconds: seconds)
+        let route = policy.route(distribution: distribution, seconds: seconds)
         lastRoute = route
 
         if let language, let probability {

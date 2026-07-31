@@ -89,3 +89,7 @@ for the design). Check items off as they land; add follow-ups at the bottom.
       ("Design note: a third route"). Plumbing generalizes; three prerequisites
       identified (argmax over cleared gates, configurable default route,
       cluster-disjointness validation). No code change.
+  - [x] Argmax over cleared gates (#18) — `route()` is a `[Gate]` table plus an
+        argmax over the LID softmax, no longer an order-dependent if-chain
+  - [ ] Make `defaultRoute` configuration rather than a hardcoded Norwegian
+  - [ ] Reject overlapping clusters at construction

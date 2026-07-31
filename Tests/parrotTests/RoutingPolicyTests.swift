@@ -54,6 +54,68 @@ final class RoutingPolicyTests: XCTestCase {
         XCTAssertEqual(loose.route(language: "en", probability: 0.4, seconds: 3), .english)
     }
 
+    /// Below τ = 0.5 two routes can hold enough mass to clear their gates at
+    /// once. The one that cleared by more has to win, and — the assertion that
+    /// actually pins it — that must not depend on where either gate sits in the
+    /// table. Every case is run against the table and its reverse.
+    func testArgmaxOverClearedGatesIgnoresTableOrder() {
+        let loose = RoutingPolicy(englishThreshold: 0.3)
+        struct Contested {
+            let distribution: [String: Float]
+            let expected: Route
+            let note: String
+        }
+        let cases: [Contested] = [
+            Contested(distribution: ["en": 0.45, "no": 0.35, "de": 0.20],
+                      expected: .english,
+                      note: "both clear, English by more"),
+            Contested(distribution: ["en": 0.35, "no": 0.45, "de": 0.20],
+                      expected: .norwegian,
+                      note: "both clear, Norwegian by more"),
+            // The cluster stands for a model, so its languages pool their mass
+            // instead of each losing to English on its own.
+            Contested(distribution: ["en": 0.40, "no": 0.25, "sv": 0.20, "da": 0.15],
+                      expected: .norwegian,
+                      note: "both clear, cluster outweighs English pooled"),
+            Contested(distribution: ["en": 0.40, "no": 0.40],
+                      expected: .norwegian,
+                      note: "exact tie takes the default route"),
+        ]
+
+        for c in cases {
+            let forward = loose.route(distribution: c.distribution, over: loose.gates)
+            let reversed = loose.route(distribution: c.distribution, over: Array(loose.gates.reversed()))
+            XCTAssertEqual(forward, c.expected, c.note)
+            XCTAssertEqual(reversed, c.expected, "\(c.note) — reversed gate table")
+        }
+    }
+
+    /// At the default threshold only one route can ever clear, so the argmax is
+    /// degenerate and the full distribution must not move any answer.
+    func testDistributionMatchesTopOneAtDefaultThreshold() {
+        let policy = RoutingPolicy()
+        let distributions: [[String: Float]] = [
+            ["en": 0.95, "no": 0.03, "de": 0.02],
+            ["en": 0.60, "no": 0.30, "sv": 0.10],
+            ["en": 0.59, "no": 0.31, "sv": 0.10],
+            ["no": 0.70, "en": 0.20, "da": 0.10],
+            ["de": 0.50, "en": 0.30, "no": 0.20],
+        ]
+        for distribution in distributions {
+            let top = distribution.max { $0.value < $1.value }!
+            XCTAssertEqual(
+                policy.route(distribution: distribution, seconds: 3),
+                policy.route(language: top.key, probability: top.value, seconds: 3),
+                "\(distribution) should route the same either way"
+            )
+        }
+
+        // Short utterances skip LID however much the distribution says.
+        XCTAssertEqual(policy.route(distribution: ["en": 0.99], seconds: 0.5), .norwegian)
+        // An empty distribution is a failed LID → default route.
+        XCTAssertEqual(policy.route(distribution: [:], seconds: 3), .norwegian)
+    }
+
     func testShouldRunLID() {
         let policy = RoutingPolicy()
         XCTAssertFalse(policy.shouldRunLID(seconds: 0.0))
