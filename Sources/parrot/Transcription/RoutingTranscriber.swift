@@ -134,30 +134,7 @@ actor RoutingTranscriber: Transcriber {
     }
 
     private func warmUpLID() async throws -> WhisperKit {
-        let model = configuration.lid
-        do {
-            guard let whisperKitID = model.whisperKitID else {
-                throw TranscriberError.missingEngineID
-            }
-            log("loading \(model.id) (lid)...\n")
-            let config = WhisperKitConfig(
-                model: whisperKitID,
-                modelRepo: model.modelRepo,
-                modelFolder: model.modelFolder,
-                verbose: false,
-                prewarm: true,
-                load: true
-            )
-            let started = recorder?.now()
-            let pipeline = try await WhisperKit(config)
-            if let recorder, let started {
-                recorder.record(modelID: "\(model.id) (lid)", start: started, end: recorder.now())
-            }
-            log("✓ \(model.id) ready\n")
-            return pipeline
-        } catch {
-            throw RoutingTranscriberError.modelUnavailable(model.id, error)
-        }
+        try await LIDPipeline.load(configuration.lid, recorder: recorder)
     }
 
     private func log(_ message: String) {

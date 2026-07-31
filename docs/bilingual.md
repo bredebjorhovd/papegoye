@@ -168,6 +168,72 @@ flags the warm-up as effectively serialized and prints how many seconds were
 lost — the failure mode where the `async let` warm-ups accidentally become a
 chain of awaits.
 
+### Measuring LID latency
+
+```sh
+parrot bench lid                                  # 1,2,5,10,30 s on noise, 5 calls each
+parrot bench lid --durations 1,10 --signals all   # silence / noise / tone at two lengths
+parrot bench lid --stages                         # also split pad / mel / encoder / decode
+parrot bench lid --json                           # machine-readable
+```
+
+LID *latency* depends on how much audio the model is handed, never on what the
+audio says, so the sweep runs on generated signals — silence, seeded noise, a
+440 Hz tone. No microphone, no fixtures, no Norwegian speaker. That bound cuts
+both ways: the harness measures latency only and says nothing about LID
+*accuracy*, which needs labelled speech.
+
+The pipeline is loaded once and one cold call is timed and discarded — the
+first `detectLangauge` after load pays for lazy CoreML setup (the ~800 ms
+outlier in a session log). Every cell after that is warm, the state the daemon
+is in for every utterance but the first. Cells longer than the budget's stated
+10 s are measured but not judged.
+
+Each row is both "an utterance of *n* seconds" and "an *n*-second LID window":
+the sweep is exactly the experiment for shortening `lidWindowSamples`.
+
+**Measured 2026-07-31, M-series, `whisper-tiny`, release build** (gh#20):
+
+```
+  signal   length     median       min       max
+  noise      1.0s     15.7ms     13.3ms     19.6ms
+  noise      5.0s     15.1ms     13.3ms     19.7ms
+  noise     10.0s     15.5ms     13.1ms     20.0ms
+  noise     30.0s     16.3ms     13.3ms     18.8ms
+
+  fixed cost 15.2ms · per second 0.04ms · 1.17× latency spread over 30× length
+  → FIXED COST · budget ≤ 30ms: PASS (median 15.4ms across 12 in-scope cells)
+```
+
+Two findings, both of which change what the fix would be:
+
+1. **Latency is a fixed cost, not a function of utterance length.** 30× the
+   audio moves the median by 1.17×; the fitted per-second term is 0.04 ms.
+   Silence, noise and tone all land within noise of each other. So *shortening
+   the 30 s `lidWindowSamples` window buys nothing* — and it cannot, because
+   `WhisperKit.detectLangauge` pads or trims whatever it is handed back up to
+   the feature extractor's own window (480000 samples = 30 s, read off the
+   loaded model and printed by the bench). A shorter LID window would mean
+   converting a mel + encoder pair with a shorter window, not changing a
+   constant.
+2. **The 66–89 ms in the gh#20 session log is a debug-build number.** The same
+   sweep on the same machine: ~52 ms from `swift build`, ~15 ms from
+   `swift build -c release`. The `--stages` split says why — the CoreML
+   encoder costs 6.1–6.2 ms in *both* builds, while the Swift half of the call
+   (mel packing, the token sampler over a 51865-entry vocabulary) collapses
+   from ~45 ms to ~8 ms. The report prints which build it measured and refuses
+   to call a debug run a verdict.
+
+The remaining gap between ~52 ms here and the 66–89 ms in the field is
+unexplained — the session had three pipelines resident and a decode running
+straight after each LID call. **Not yet done: re-measure in a live release
+build with a microphone.** Until then the acceptance item stays open; a
+synthetic bench passing is not the same as the daemon passing.
+
+The default window is unchanged in either case (the ticket asked for numbers,
+not a change), and nothing here measures ANE residency — that needs
+`sudo powermetrics`.
+
 ## CLI
 
 ```sh
@@ -186,6 +252,9 @@ parrot doctor --bilingual              # checks the bilingual model set is downl
   audio or models needed.
 - `swift test --filter WarmUpProfileTests` — warm-start analysis: median,
   ratio vs the 1.5× budget, and the "not overlapping" flag. No models needed.
+- `swift test --filter LIDProfileTests` — LID latency analysis: synthetic
+  signal generation, the fixed-cost vs tracks-length verdict, budget scope,
+  and the debug-build warning. No models needed.
 - `PARROT_INTEGRATION=1 swift test --filter RoutingIntegrationTests` —
   fixture WAVs → assert route + transcript emptiness; see
   `Tests/fixtures/README.md`. Fixtures are recorded with `--dump-wav`.
