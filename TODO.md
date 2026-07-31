@@ -30,8 +30,10 @@ for the design). Check items off as they land; add follow-ups at the bottom.
 
 ## Next — needs a Mac (Apple Silicon)
 
-- [ ] `swift build` — first compile; fix any nits (written on Linux, unverified)
-- [ ] `swift test --filter RoutingPolicyTests`
+- [x] `swift build` — first compile; fixed two actor-isolation nits
+      (`nonisolated modelID`, captured-`var decision` → `let`). Clean, no warnings.
+- [x] `swift test --filter RoutingPolicyTests` — 6/6 pass
+- [x] CLI smoke: `--help`, `models list [--all]`, `run --help`, `doctor --bilingual`
 - [ ] Convert NB-Whisper: `scripts/convert-nb-whisper.sh small`
   - [ ] Verify output layout matches an `argmaxinc/whisperkit-coreml` model
   - [ ] Transcribe a Norwegian reference clip; diff against the PyTorch

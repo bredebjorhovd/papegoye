@@ -1,5 +1,8 @@
 .build/
 .swiftpm/
+# scripts/convert-nb-whisper.sh writes its venv and ~1 GB of CoreML artifacts
+# here. Never belongs in the repo.
+build/
 *.xcodeproj
 *.xcworkspace
 .DS_Store

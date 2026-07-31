@@ -35,8 +35,34 @@ if [[ "$(uname -s)/$(uname -m)" != "Darwin/arm64" ]]; then
 fi
 
 # -- toolchain ---------------------------------------------------------------
+# whisperkittools pins torch==2.5.0, which has no wheels past CPython 3.12 — on
+# a Mac whose default python3 is newer, `pip install` fails with a bare "no
+# matching distribution" that says nothing about the version being the problem.
+# Pick a supported interpreter instead of inheriting whatever python3 is.
+find_python() {
+    if [[ -n "${PYTHON:-}" ]]; then echo "$PYTHON"; return; fi
+    for candidate in python3.12 python3.11 python3.10; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            command -v "$candidate"
+            return
+        fi
+    done
+    # Fall back to python3 only if it is old enough to work.
+    if python3 -c 'import sys; sys.exit(0 if sys.version_info[:2] <= (3, 12) else 1)' 2>/dev/null; then
+        command -v python3
+    fi
+}
+
 if [[ ! -d "$VENV" ]]; then
-    python3 -m venv "$VENV"
+    PYTHON_BIN="$(find_python)"
+    if [[ -z "$PYTHON_BIN" ]]; then
+        echo "error: need CPython <= 3.12 for whisperkittools (torch==2.5.0 has no newer wheels)." >&2
+        echo "       default python3 is $(python3 --version 2>&1 | awk '{print $2}')." >&2
+        echo "       install one, or set PYTHON=/path/to/python3.12 and re-run." >&2
+        exit 1
+    fi
+    echo "== venv interpreter: $PYTHON_BIN ($("$PYTHON_BIN" --version 2>&1 | awk '{print $2}'))"
+    "$PYTHON_BIN" -m venv "$VENV"
 fi
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
@@ -55,6 +81,24 @@ GENERATED=$(find "$OUT_DIR" -maxdepth 1 -type d -iname "*nb-whisper-${VARIANT}*"
 if [[ -n "$GENERATED" && ! -d "$OUT_DIR/$MODEL_NAME" ]]; then
     mv "$GENERATED" "$OUT_DIR/$MODEL_NAME"
 fi
+
+# whisperkit-generate-model emits only the compiled .mlmodelc bundles. The HF
+# config files stay behind in the source snapshot, but an
+# argmaxinc/whisperkit-coreml folder carries them alongside the models — and
+# WhisperKit reads config.json to size the decoder. Copy them across.
+SNAPSHOT=$(python - <<PY
+from huggingface_hub import snapshot_download
+print(snapshot_download("${HF_MODEL}",
+                        allow_patterns=["config.json", "generation_config.json"]))
+PY
+)
+for f in config.json generation_config.json; do
+    if [[ -f "$SNAPSHOT/$f" ]]; then
+        cp "$SNAPSHOT/$f" "$OUT_DIR/$MODEL_NAME/$f"
+    else
+        echo "warning: ${HF_MODEL} has no $f — skipping" >&2
+    fi
+done
 
 echo "== artifacts:"
 ls -la "$OUT_DIR/$MODEL_NAME"
