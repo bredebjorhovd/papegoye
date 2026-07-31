@@ -41,8 +41,15 @@ for the design). Check items off as they land; add follow-ups at the bottom.
       captured-var warning in `Run.run()`. Clean, no warnings.
 - [x] `swift test --filter RoutingPolicyTests` — 6/6 pass
 - [x] CLI smoke: `--help`, `models list [--all]`, `run --help`, `doctor --bilingual`
-- [ ] Convert NB-Whisper: `scripts/convert-nb-whisper.sh small`
-  - [ ] Verify output layout matches an `argmaxinc/whisperkit-coreml` model
+- [x] Convert NB-Whisper: `scripts/convert-nb-whisper.sh small` — needed two
+      fixes first (CPython ≤ 3.12 for `torch==2.5.0`; copy `config.json` +
+      `generation_config.json` from the HF snapshot). See c8c218c.
+  - [x] Verify output layout matches an `argmaxinc/whisperkit-coreml` model —
+        all four required paths present; `config.json` is multilingual
+        whisper-small (d_model 768, 12/12 layers, vocab 51865)
+  - [x] **WhisperKit loads the converted folder** — `✓ nb-whisper-small ready`
+        via `PARROT_NB_MODEL_FOLDER`. Tokenizer resolution for a model id
+        WhisperKit does not know was the open risk; it is not a problem.
   - [ ] Transcribe a Norwegian reference clip; diff against the PyTorch
         checkpoint (whitespace/punctuation drift OK, wording drift not)
   - [ ] Verify ANE residency with `sudo powermetrics --samplers ane_power`
@@ -60,10 +67,13 @@ for the design). Check items off as they land; add follow-ups at the bottom.
       **zero** stock-Whisper-on-Norwegian outputs
 - [ ] Latency: LID ≤ 30 ms on ANE for ≤ 10 s utterance (read from `◐ lid` logs)
 - [ ] Latency: total routing overhead ≤ 80 ms p50 vs single-model parrot
-- [ ] Startup: three-model warm start ≤ 1.5× current single-model warm start
-      — harness ready (`parrot bench warmup`), measurement blocked: NB-Whisper
-      is not converted yet, so the real three-model set cannot be loaded.
-      Run it once `nb-whisper-small` is on disk.
+- [x] Startup: three-model warm start ≤ 1.5× current single-model warm start —
+      **1.11×, PASS** (`parrot bench warmup --iterations 3`, 2026-07-31).
+      single-model `whisper-base.en` warm 3.708s; bilingual
+      `whisper-tiny + nb-whisper-small + whisper-small.en` warm 4.116s.
+      Overlap efficiency 1.00 — the three `async let` warm-ups genuinely run
+      concurrently rather than degrading into a chain of awaits.
+      Warm numbers only; cold-from-boot needs `sudo purge` first.
 - [ ] Memory: confirm ~1 GB resident is acceptable; else fall back to
       `--en-model whisper-base.en` and document
 - [ ] Verify NB-Whisper silence output is caught by `sanitize()` on real
