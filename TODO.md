@@ -83,12 +83,15 @@ for the design). Check items off as they land; add follow-ups at the bottom.
       run with a microphone, plus powermetrics for the "on ANE" half.
 - [ ] Latency: total routing overhead ≤ 80 ms p50 vs single-model parrot
 - [x] Startup: three-model warm start ≤ 1.5× current single-model warm start —
-      **1.11×, PASS** (`parrot bench warmup --iterations 3`, 2026-07-31).
-      single-model `whisper-base.en` warm 3.708s; bilingual
-      `whisper-tiny + nb-whisper-small + whisper-small.en` warm 4.116s.
+      **1.31×, PASS** (`parrot bench warmup --iterations 3`, release build,
+      2026-07-31). single-model `whisper-base.en` warm 3.781s; bilingual
+      `whisper-tiny + nb-whisper-small + whisper-small.en` warm 4.944s.
       Overlap efficiency 1.00 — the three `async let` warm-ups genuinely run
       concurrently rather than degrading into a chain of awaits.
       Warm numbers only; cold-from-boot needs `sudo purge` first.
+      (First recorded as 1.11× from a debug build. Same lesson as gh#20:
+      quote the build, or the number is not an acceptance result. Debug
+      flattered the ratio here rather than hurting it.)
 - [ ] Memory: confirm ~1 GB resident is acceptable; else fall back to
       `--en-model whisper-base.en` and document
 - [ ] Verify NB-Whisper silence output is caught by `sanitize()` on real
