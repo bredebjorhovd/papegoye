@@ -1,4 +1,4 @@
-# parrot (papegøye fork)
+# 🦜🦜🦜 Papegøye (Parrot fork)
 
 A minimal macOS dictation daemon. Push-to-talk, on-device transcription, text inserted at the cursor.
 
