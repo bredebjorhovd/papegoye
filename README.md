@@ -26,6 +26,33 @@ parrot install --launch-at-login   # optional — runs in the background on logi
 
 The installer drops the binary in `/usr/local/bin/parrot`. Builds are unsigned for now, so the installer strips the quarantine xattr — once you've inspected the script you'll see exactly what it does.
 
+### Launch at login
+
+`install --launch-at-login` writes a LaunchAgent to
+`~/Library/LaunchAgents/com.digimata.parrot.plist`. The run flags you pass it
+are forwarded into the agent, so the daemon starts the way you'd start it by
+hand:
+
+```sh
+parrot install --launch-at-login --bilingual
+parrot install --launch-at-login --bilingual --en-model whisper-small.en
+parrot install --uninstall             # boots the agent out and deletes the plist
+```
+
+Model ids are checked when you install, not at next login — a bad `--no-model`
+fails in your terminal instead of silently in `/tmp/parrot.err.log`.
+
+A LaunchAgent inherits none of your shell environment, so if
+`PARROT_NB_MODEL_FOLDER` is set when you install — pointing at a local
+NB-Whisper conversion from `scripts/convert-nb-whisper.sh` — it is baked into
+the plist's `EnvironmentVariables` and printed back to you. It is a snapshot:
+move the model and you have to re-run `parrot install --launch-at-login`.
+
+> This env-var half exists only until the converted NB-Whisper CoreML artifacts
+> are published (#2). Once `nb-whisper-small` downloads from Hugging Face like
+> every other model, nothing needs `EnvironmentVariables` and you can install
+> without it.
+
 ## How to use
 
 1. **Run it.** Either `parrot install --launch-at-login` (daemonized, runs forever, lives in the menu bar), or `parrot` in any terminal tab.
@@ -43,6 +70,7 @@ That's it. There is no record button, no stop button, no "send" — `fn` is the 
 parrot                                 # run in the foreground (^C to quit)
 parrot setup                           # one-time setup: permissions + model download
 parrot install --launch-at-login       # register a LaunchAgent (background daemon)
+parrot install --launch-at-login --bilingual   # ...running bilingual mode at login
 parrot install --uninstall             # remove the LaunchAgent
 parrot doctor                          # check permissions + fn key setting
 parrot models list                     # list available models
