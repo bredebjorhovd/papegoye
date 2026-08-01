@@ -109,7 +109,10 @@ drop the English route to base.en: `--en-model whisper-base.en`.
 `TranscriptionModel` gained two fields for models outside WhisperKit's default
 repo: `modelRepo` (custom HF repo for the CoreML artifacts) and `modelFolder`
 (local path override, takes precedence — also settable at runtime for the NB
-model via `PARROT_NB_MODEL_FOLDER` for testing a fresh conversion).
+model via `PARROT_NB_MODEL_FOLDER` for testing a fresh conversion). A
+LaunchAgent inherits no shell environment, so `parrot install
+--launch-at-login` copies `PARROT_NB_MODEL_FOLDER` into the plist's
+`EnvironmentVariables` when it is set — see the README.
 
 The bilingual composite is a **flag**, not a registry entry (spec open
 question 1): the registry stays purely per-model, and
