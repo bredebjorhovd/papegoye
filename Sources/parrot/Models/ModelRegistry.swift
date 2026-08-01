@@ -9,7 +9,8 @@ enum ModelRegistry {
     /// HF repo holding the converted NB-Whisper CoreML artifacts. Produced by
     /// scripts/convert-nb-whisper.sh; override per-model via `modelFolder` or
     /// at runtime with PARROT_NB_MODEL_FOLDER for a local conversion.
-    static let nbWhisperRepo = "bredebjorhovd/nb-whisper-coreml"
+    /// Namespace is the Hugging Face account, which is not the GitHub one.
+    static let nbWhisperRepo = "Barrymanalow/nb-whisper-coreml"
 
     static let shared: [TranscriptionModel] = [
         TranscriptionModel(

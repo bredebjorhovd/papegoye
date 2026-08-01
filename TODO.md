@@ -60,8 +60,16 @@ for the design). Check items off as they land; add follow-ups at the bottom.
         checkpoint (whitespace/punctuation drift OK, wording drift not)
   - [ ] Verify ANE residency with `sudo powermetrics --samplers ane_power`
         while transcribing — not just "it ran"
-- [ ] Publish artifacts: `HF_UPLOAD_REPO=<owner>/nb-whisper-coreml scripts/convert-nb-whisper.sh small`
-  - [ ] Confirm/rename `ModelRegistry.nbWhisperRepo` to the real repo id
+- [x] Publish artifacts — `Barrymanalow/nb-whisper-coreml`, public, 21 files.
+      Uploaded the already-converted folder directly rather than re-running the
+      script, which would have reconverted from scratch.
+  - [x] `ModelRegistry.nbWhisperRepo` set to the real repo id. The HF account is
+        `Barrymanalow`, not the GitHub handle — the placeholder guessed wrong,
+        which is what the 403 on repo creation was.
+  - [x] Verified as a fresh user would: `PARROT_NB_MODEL_FOLDER` unset, no
+        cached copy, `parrot models download nb-whisper-small` → `✓ ready`
+        (465 MB fetched to ~/Documents/huggingface). Anonymous HTTP 200 on
+        config.json, so no token is needed to consume it.
 - [ ] End-to-end smoke: `parrot --bilingual` — download, warm-up, dictate both languages
 - [ ] Record fixtures with `--dump-wav` (no-bokmål, no-with-English-terms, en,
       short-ok, silence) → `Tests/fixtures/`
