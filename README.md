@@ -16,15 +16,54 @@ NB-Whisper → CoreML conversion.
 
 ## Install
 
+Download the latest release into a directory on your `PATH` — `~/.local/bin`
+needs no `sudo`:
+
 ```sh
-curl -fsSL https://digimata.github.io/parrot/install.sh | sh
-parrot setup                       # grants mic + accessibility, downloads the model
-parrot install --launch-at-login   # optional — runs in the background on login
+mkdir -p ~/.local/bin
+curl -fsSL https://github.com/bredebjorhovd/papegoye/releases/latest/download/parrot-macos-arm64.tar.gz \
+  | tar xz -C ~/.local/bin
+
+parrot setup                                    # mic + accessibility permissions
+parrot --bilingual                              # first run downloads the models
+parrot install --launch-at-login --bilingual    # optional — starts at login
 ```
 
-**Requires:** macOS 14+ on Apple Silicon (M1 or newer). Transcription runs on the Apple Neural Engine via CoreML — so the installer refuses to run on Intel.
+**Requires:** macOS 14+ on Apple Silicon (M1 or newer). Transcription runs on
+the Apple Neural Engine via CoreML, so Intel is not supported.
 
-The installer drops the binary in `/usr/local/bin/parrot`. Builds are unsigned for now, so the installer strips the quarantine xattr — once you've inspected the script you'll see exactly what it does.
+First run downloads three models (~1 GB total): multilingual `whisper-tiny` for
+language identification, [`nb-whisper-small`](https://huggingface.co/Barrymanalow/nb-whisper-coreml)
+for Norwegian, and `whisper-small.en` for English. No account or token needed.
+
+### A note on the unsigned binary
+
+Releases are unsigned and un-notarized. The `curl` command above is unaffected —
+`curl` does not set the quarantine attribute, so the binary runs as-is.
+
+If you download the tarball **through a browser** instead, macOS quarantines it
+and refuses to run it. macOS 15 removed the old Control-click → Open bypass, so
+either clear the attribute:
+
+```sh
+xattr -d com.apple.quarantine ~/.local/bin/parrot
+```
+
+or approve it once under System Settings → Privacy & Security → *Open Anyway*.
+
+Because the binary is unsigned, macOS identifies it by path and contents — so
+**replacing it on upgrade usually means re-granting Accessibility** under
+System Settings → Privacy & Security → Accessibility.
+
+### Build from source instead
+
+```sh
+git clone https://github.com/bredebjorhovd/papegoye.git
+cd papegoye && swift build -c release
+cp .build/release/parrot ~/.local/bin/parrot
+```
+
+Building locally sidesteps quarantine entirely.
 
 ### Launch at login
 
