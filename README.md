@@ -2,6 +2,8 @@
 
 A minimal macOS dictation daemon. Push-to-talk, on-device transcription, text inserted at the cursor.
 
+Fork of [Parrot](https://github.com/digimata/parrot) (© 2026 Andrew Jones) — this repo is `digimata/parrot` plus bilingual Norwegian/English routing.
+
 This fork adds **bilingual Norwegian/English dictation**: hold Fn, speak either
 language, and each utterance is routed automatically to
 [NB-Whisper](https://huggingface.co/NbAiLab) (Norwegian) or stock Whisper
