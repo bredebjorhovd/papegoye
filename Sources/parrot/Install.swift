@@ -252,24 +252,41 @@ struct Install: ParsableCommand {
     }
 
     private func resolveBinaryPath() throws -> String {
-        // /usr/local/bin/parrot is the canonical install path. Honor a real
-        // location if running from elsewhere (e.g. dev).
+        // /usr/local/bin/parrot is the canonical install path, but ~/.local/bin
+        // (or anything on PATH) is equally valid — the agent must point at the
+        // binary the user actually runs, wherever that is.
         let candidate = "/usr/local/bin/parrot"
         if FileManager.default.isExecutableFile(atPath: candidate) {
             return candidate
         }
-        // Fall back to the running executable's resolved path.
-        let argv0 = CommandLine.arguments.first ?? "parrot"
-        if argv0.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: argv0) {
+        // Resolve the running executable, following PATH and symlinks. argv0 is
+        // just "parrot" when invoked via PATH, so look it up directly.
+        if let running = runningExecutablePath(), FileManager.default.isExecutableFile(atPath: running) {
             FileHandle.standardError.write(Data(
-                "note: /usr/local/bin/parrot not found; using \(argv0)\n".utf8
+                "note: /usr/local/bin/parrot not found; using \(running)\n".utf8
             ))
-            return argv0
+            return running
         }
         FileHandle.standardError.write(Data(
             "couldn't locate the parrot binary. install it to /usr/local/bin/parrot first.\n".utf8
         ))
         throw ExitCode(1)
+    }
+
+    /// Absolute, symlink-resolved path of the currently running executable,
+    /// regardless of how it was invoked (PATH, symlink, explicit path).
+    private func runningExecutablePath() -> String? {
+        var size: UInt32 = 0
+        _ = _NSGetExecutablePath(nil, &size)
+        guard size > 0 else { return nil }
+        var buffer = [CChar](repeating: 0, count: Int(size))
+        guard _NSGetExecutablePath(&buffer, &size) == 0 else { return nil }
+        var path = String(cString: buffer)
+        if let resolved = realpath(path, nil) {
+            defer { free(resolved) }
+            path = String(cString: resolved)
+        }
+        return path
     }
 
     private func uid() -> uid_t { getuid() }
