@@ -26,6 +26,9 @@ actor WhisperKitTranscriber: Transcriber {
         guard let whisperKitID = model.whisperKitID else {
             throw TranscriberError.missingEngineID
         }
+        if ModelFetch.needsDownload(model) {
+            try await ModelFetch.download(model)
+        }
         FileHandle.standardError.write(Data("loading \(model.id)...\n".utf8))
         let config = WhisperKitConfig(
             model: whisperKitID,

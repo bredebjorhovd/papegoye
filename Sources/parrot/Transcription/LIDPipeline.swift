@@ -14,6 +14,9 @@ enum LIDPipeline {
                 throw TranscriberError.missingEngineID
             }
             FileHandle.standardError.write(Data("loading \(model.id) (lid)...\n".utf8))
+            if ModelFetch.needsDownload(model) {
+                try await ModelFetch.download(model)
+            }
             let config = WhisperKitConfig(
                 model: whisperKitID,
                 modelRepo: model.modelRepo,
