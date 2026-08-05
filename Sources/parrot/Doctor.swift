@@ -88,25 +88,52 @@ enum DoctorReport {
                 remediation: "run parrot and hold Fn once; macOS will prompt"
             )
         case .denied, .restricted:
+            // The mic grant attaches to the same app the AX grant does.
+            let subject = AccessibilitySubjectResolver.resolve().displayName
             return Check(
                 name: "microphone",
                 status: .fail("denied"),
-                remediation: "System Settings → Privacy & Security → Microphone → enable for your terminal"
+                remediation: "System Settings → Privacy & Security → Microphone → enable for \(subject)"
             )
         @unknown default:
             return Check(name: "microphone", status: .fail("unknown state"), remediation: nil)
         }
     }
 
-    static func checkAccessibility() -> Check {
-        if AXIsProcessTrusted() {
+    /// "Not granted" and "not grantable from here" need different actions from
+    /// the user, and a grant lost to a binary upgrade needs a third (gh#31), so
+    /// report the diagnosis rather than the bare AX boolean.
+    static func checkAccessibility(store: AccessibilityStore = .shared) -> Check {
+        let subject = AccessibilitySubjectResolver.resolve()
+        let trusted = AccessibilityTrust.isTrusted()
+        if trusted {
+            // Remember what was granted while we can see it — that record is
+            // the only way a later run can tell an upgrade-revoked grant from
+            // one that was never given.
+            store.noteGranted(subject: subject)
+        }
+        let diagnosis = AccessibilityDiagnosis.classify(
+            trusted: trusted,
+            record: store.load(),
+            binary: BinaryIdentity.current(),
+            session: SessionKind.detect()
+        )
+        return check(for: diagnosis, subject: subject)
+    }
+
+    /// Pure mapping from diagnosis to reported check.
+    static func check(
+        for diagnosis: AccessibilityDiagnosis,
+        subject: AccessibilitySubject
+    ) -> Check {
+        let remediation = AccessibilityGuidance.remediation(for: diagnosis, subject: subject)
+        if case .granted = diagnosis {
             return Check(name: "accessibility", status: .ok, remediation: nil)
         }
-        let parent = parentProcessName() ?? "your terminal"
         return Check(
             name: "accessibility",
-            status: .fail("not granted"),
-            remediation: "System Settings → Privacy & Security → Accessibility → enable for \(parent)"
+            status: .fail(AccessibilityGuidance.summary(for: diagnosis)),
+            remediation: remediation
         )
     }
 
@@ -167,27 +194,6 @@ enum DoctorReport {
         guard task.terminationStatus == 0 else { return nil }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func parentProcessName() -> String? {
-        let ppid = getppid()
-        let task = Process()
-        task.launchPath = "/bin/ps"
-        task.arguments = ["-p", String(ppid), "-o", "comm="]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = Pipe()
-        do {
-            try task.run()
-        } catch {
-            return nil
-        }
-        task.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        guard let s = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else {
-            return nil
-        }
-        return (s as NSString).lastPathComponent
     }
 
     static func print(_ checks: [Check]) {

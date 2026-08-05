@@ -16,30 +16,92 @@ struct Setup: ParsableCommand {
         print("  1. Accessibility — to detect the Fn key globally and inject text at the cursor.")
         print("  2. Microphone — to record audio while you hold Fn.")
         print()
-        print("These attach to your terminal app (Terminal/iTerm/Ghostty/etc.), not parrot itself.")
+        let subject = AccessibilitySubjectResolver.resolve()
+        switch subject {
+        case .hostApplication(let name, _):
+            print("Both attach to \(name) — the app that launched parrot — not to parrot itself.")
+        case .ownBinary(let path):
+            print("No GUI app owns this session, so both attach to parrot itself: \(path)")
+        }
         print()
 
-        try waitForAccessibility()
+        try waitForAccessibility(subject: subject)
         print()
         try waitForMicrophone()
         print()
         print("✓ all set. Run `parrot` to start the daemon.")
     }
 
-    private func waitForAccessibility() throws {
-        if AXIsProcessTrusted() {
+    /// The prompt is a best case, not a guarantee: macOS shows it once per app,
+    /// and not at all in a remote session. So ask, wait briefly, and if trust
+    /// doesn't arrive fall through to a deep link that names the app the user
+    /// has to toggle — then keep polling so a flipped switch finishes setup
+    /// without a re-run (gh#31).
+    private func waitForAccessibility(subject: AccessibilitySubject) throws {
+        let store = AccessibilityStore.shared
+
+        if AccessibilityTrust.isTrusted() {
             print("✓ accessibility already granted")
+            store.noteGranted(subject: subject)
             return
         }
 
-        print("→ opening accessibility prompt...")
-        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        _ = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
+        let session = SessionKind.detect()
+        var record = store.load()
+        if !record.prompted, session == .gui {
+            print("→ asking macOS for accessibility access...")
+            AccessibilityTrust.requestPrompt()
+            store.notePrompted()
+            record.prompted = true
+            if AccessibilityTrust.waitForTrust(seconds: AccessibilityTrust.promptGrace) {
+                print("✓ accessibility granted")
+                store.noteGranted(subject: subject)
+                return
+            }
+            print()
+        }
+
+        let diagnosis = AccessibilityDiagnosis.classify(
+            trusted: false,
+            record: record,
+            binary: BinaryIdentity.current(),
+            session: session
+        )
+        for line in AccessibilityGuidance.instructions(for: diagnosis, subject: subject) {
+            print(line)
+        }
+
+        if case .cannotPrompt = diagnosis {
+            // Nothing to wait for: there is no local desktop to grant from.
+            print()
+            print("  then re-run `parrot setup` from the machine's own desktop.")
+            throw ExitCode(1)
+        }
 
         print()
-        print("  1. Toggle your terminal on in the Accessibility list.")
-        print("  2. Re-run `parrot setup` — macOS only picks up the grant on a fresh process.")
-        throw ExitCode(0)
+        print("  opening \(AccessibilityGuidance.settingsPath)...")
+        SystemSettings.open(pane: AccessibilityGuidance.settingsPane)
+        let waitMinutes = Int(AccessibilityTrust.settingsGrace / 60)
+        print("  waiting for the toggle (up to \(waitMinutes) min) — setup continues by itself. ^C to stop.")
+
+        let granted = AccessibilityTrust.waitForTrust(
+            seconds: AccessibilityTrust.settingsGrace,
+            onPoll: { attempt in
+                // A dot every 15s: enough to show it's alive, quiet enough to read.
+                let every = Int(15 / AccessibilityTrust.pollInterval)
+                if attempt > 0, attempt % every == 0 {
+                    FileHandle.standardOutput.write(Data(".".utf8))
+                }
+            }
+        )
+        print()
+        guard granted else {
+            print("✗ still not granted after \(waitMinutes) min.")
+            print("  flip the toggle, then re-run `parrot setup`.")
+            throw ExitCode(1)
+        }
+        print("✓ accessibility granted")
+        store.noteGranted(subject: subject)
     }
 
     private func waitForMicrophone() throws {
@@ -51,7 +113,7 @@ struct Setup: ParsableCommand {
         case .denied, .restricted:
             print("✗ microphone is denied — macOS won't re-prompt once denied.")
             print("  opening Settings → Privacy & Security → Microphone...")
-            openSettings("Privacy_Microphone")
+            SystemSettings.open(pane: "Privacy_Microphone")
             print("  enable your terminal, then re-run `parrot setup`.")
             throw ExitCode(1)
         case .notDetermined:
@@ -72,13 +134,5 @@ struct Setup: ParsableCommand {
         @unknown default:
             print("? microphone in unknown state")
         }
-    }
-
-    private func openSettings(_ pane: String) {
-        let url = "x-apple.systempreferences:com.apple.preference.security?\(pane)"
-        let task = Process()
-        task.launchPath = "/usr/bin/open"
-        task.arguments = [url]
-        try? task.run()
     }
 }

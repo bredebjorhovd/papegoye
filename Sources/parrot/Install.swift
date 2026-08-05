@@ -261,7 +261,7 @@ struct Install: ParsableCommand {
         }
         // Resolve the running executable, following PATH and symlinks. argv0 is
         // just "parrot" when invoked via PATH, so look it up directly.
-        if let running = runningExecutablePath(), FileManager.default.isExecutableFile(atPath: running) {
+        if let running = ExecutablePath.current(), FileManager.default.isExecutableFile(atPath: running) {
             FileHandle.standardError.write(Data(
                 "note: /usr/local/bin/parrot not found; using \(running)\n".utf8
             ))
@@ -271,22 +271,6 @@ struct Install: ParsableCommand {
             "couldn't locate the parrot binary. install it to /usr/local/bin/parrot first.\n".utf8
         ))
         throw ExitCode(1)
-    }
-
-    /// Absolute, symlink-resolved path of the currently running executable,
-    /// regardless of how it was invoked (PATH, symlink, explicit path).
-    private func runningExecutablePath() -> String? {
-        var size: UInt32 = 0
-        _ = _NSGetExecutablePath(nil, &size)
-        guard size > 0 else { return nil }
-        var buffer = [CChar](repeating: 0, count: Int(size))
-        guard _NSGetExecutablePath(&buffer, &size) == 0 else { return nil }
-        var path = String(cString: buffer)
-        if let resolved = realpath(path, nil) {
-            defer { free(resolved) }
-            path = String(cString: resolved)
-        }
-        return path
     }
 
     private func uid() -> uid_t { getuid() }
