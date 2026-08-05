@@ -179,7 +179,20 @@ When you launch `parrot` from `Terminal.app`, accessibility permission is grante
 - Switching terminals (Terminal → iTerm → Ghostty) requires re-granting permission.
 - Running under `launchd` requires granting permission to whatever spawns it.
 
-This is a macOS platform behavior, not a parrot bug. `parrot doctor` will identify the parent process and tell the user which app needs the permission.
+This is a macOS platform behavior, not a parrot bug. `parrot doctor` walks up the process tree to the nearest GUI application and tells the user which app needs the permission — falling back to parrot's own binary path when nothing GUI owns the session (LaunchAgent, SSH).
+
+### The prompt is not guaranteed
+
+`AXIsProcessTrustedWithOptions([kAXTrustedCheckOptionPrompt: true])` shows its dialog at most once per app, and never in a remote session; `AXIsProcessTrusted()` returns `false` for "never asked", "asked and declined" and "cannot ask" alike. Waiting on a prompt that will never come is what made setup look broken (gh#31), so parrot keeps its own record — `~/Library/Application Support/parrot/accessibility.json`, overridable with `PARROT_STATE_DIR` — of whether it has prompted, which subject held the grant, and the binary's path+size+mtime at the time. That turns one boolean into four distinguishable states:
+
+| State | What the user is told |
+|---|---|
+| never prompted | run `parrot setup`; macOS will ask on behalf of \<app\> |
+| prompt already spent | the deep link, plus the app to enable |
+| cannot prompt (SSH) | why no dialog is possible, plus the manual path |
+| revoked after upgrade | remove the stale parrot entry with −, then re-add the new binary |
+
+`setup` deep-links to `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility` and then polls `AXIsProcessTrusted()` for up to three minutes, so flipping the toggle finishes setup in place rather than requiring a re-run.
 
 ## Models — what ships
 

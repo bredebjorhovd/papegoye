@@ -55,7 +55,17 @@ or approve it once under System Settings → Privacy & Security → *Open Anyway
 
 Because the binary is unsigned, macOS identifies it by path and contents — so
 **replacing it on upgrade usually means re-granting Accessibility** under
-System Settings → Privacy & Security → Accessibility.
+System Settings → Privacy & Security → Accessibility. `parrot doctor` recognises
+that case and says so, instead of reporting a plain "not granted".
+
+### If the accessibility prompt never appears
+
+macOS offers that prompt at most once per app, so on a machine where it was
+already dismissed — or over SSH, where it can't appear at all — `parrot setup`
+skips the wait, opens Privacy & Security → Accessibility for you, and names the
+app to toggle. That app is your *terminal* (Terminal, iTerm, Ghostty…), not
+parrot: the grant follows whatever launched parrot. Setup keeps watching while
+you flip the switch and continues on its own, so there is nothing to re-run.
 
 ### Build from source instead
 
