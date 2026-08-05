@@ -13,15 +13,22 @@ struct Check {
     let name: String
     let status: CheckStatus
     let remediation: String?
+    /// Shown in place of the bare "ok" when a passing check still has something
+    /// worth saying — which mic we picked, say.
+    var detail: String? = nil
 }
 
 enum DoctorReport {
     /// `models` — the active configuration's model set (three in bilingual
     /// mode). Missing downloads are a warning, not a failure: warmup will
     /// download them, but on a slow link you'd rather know up front.
-    static func run(models: [TranscriptionModel] = []) -> [Check] {
+    static func run(
+        models: [TranscriptionModel] = [],
+        inputPreference: InputDevicePolicy.Preference = .auto
+    ) -> [Check] {
         var checks = [
             checkMicrophone(),
+            checkInputDevice(AudioDevices.resolve(preference: inputPreference)),
             checkAccessibility(),
             checkFnKeyMapping(),
         ]
@@ -74,6 +81,43 @@ enum DoctorReport {
         }
         let contents = (try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []
         return !contents.isEmpty
+    }
+
+    /// Report which microphone recording will actually use, and say so even
+    /// when everything is fine — a policy that silently moves off the device
+    /// the user picked in System Settings has to be visible somewhere (gh#30).
+    static func checkInputDevice(_ selection: InputSelection) -> Check {
+        let name = "input device"
+        switch selection.reason {
+        case .noMatch(let requested):
+            let available = AudioDevices.inputDevices().map { $0.name }
+            return Check(
+                name: name,
+                status: .fail(selection.description),
+                remediation: available.isEmpty
+                    ? "no input devices found at all — is \"\(requested)\" connected?"
+                    : "available: \(available.joined(separator: ", "))"
+            )
+        case .noDevices:
+            return Check(
+                name: name,
+                status: .warn("couldn't enumerate input devices"),
+                remediation: "recording will fall back to the system default"
+            )
+        case .bluetoothUnavoidable:
+            return Check(
+                name: name,
+                status: .warn(selection.description),
+                remediation: "connect any other microphone to avoid the HFP downgrade"
+            )
+        case .explicit, .systemDefaultRequested, .systemDefault, .avoidedBluetooth:
+            return Check(
+                name: name,
+                status: .ok,
+                remediation: nil,
+                detail: selection.description
+            )
+        }
     }
 
     static func checkMicrophone() -> Check {
@@ -200,7 +244,7 @@ enum DoctorReport {
         for c in checks {
             let (mark, label): (String, String) = {
                 switch c.status {
-                case .ok: return ("✓", "ok")
+                case .ok: return ("✓", c.detail ?? "ok")
                 case .warn(let msg): return ("!", msg)
                 case .fail(let msg): return ("✗", msg)
                 }

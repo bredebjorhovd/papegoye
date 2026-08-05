@@ -13,6 +13,27 @@ struct Parrot: ParsableCommand {
     )
 }
 
+extension InputDevicePolicy.Preference: ExpressibleByArgument {
+    init?(argument: String) {
+        guard let parsed = InputDevicePolicy.Preference.parse(argument) else { return nil }
+        self = parsed
+    }
+
+    var defaultValueDescription: String { "auto" }
+}
+
+/// Shared help text — `run`, `doctor` and `install` all take this flag and
+/// should describe it identically.
+let inputDeviceHelp = ArgumentHelp(
+    "Microphone to record from: a device name, or 'default' for the system default input.",
+    discussion: """
+        Default is 'auto': if the system default input is a Bluetooth headset \
+        and any other input exists, parrot records from the other one. Opening \
+        a Bluetooth mic drops the headset to HFP — 16 kHz mono, and audibly \
+        distorted for whatever it is playing.
+        """
+)
+
 struct Run: ParsableCommand {
     static let configuration = CommandConfiguration(
         commandName: "run",
@@ -49,6 +70,9 @@ struct Run: ParsableCommand {
 
     @Option(name: .customLong("en-threshold"), help: "Bilingual: LID confidence gate for the English route (0-1).")
     var enThreshold: Float = RoutingPolicy.defaultEnglishThreshold
+
+    @Option(name: .customLong("input-device"), help: inputDeviceHelp)
+    var inputDevice: InputDevicePolicy.Preference = .auto
 
     func validate() throws {
         if bilingual, model != nil {
@@ -120,7 +144,7 @@ struct Run: ParsableCommand {
         }
 
         if !skipDoctor {
-            let checks = DoctorReport.run(models: activeModels)
+            let checks = DoctorReport.run(models: activeModels, inputPreference: inputDevice)
             if !DoctorReport.allOK(checks) {
                 FileHandle.standardError.write(Data("startup checks failed:\n".utf8))
                 DoctorReport.print(checks)
@@ -150,6 +174,25 @@ struct Run: ParsableCommand {
 
         let monitor = HotkeyMonitor(debug: debugHotkey)
         let capture = AudioCapture()
+        capture.inputPreference = inputDevice
+
+        // Resolve once up front so the log says which mic we're on before
+        // anyone has spoken into it, and so a bad --input-device is visible at
+        // startup rather than on the first Fn press.
+        let initialInput = AudioDevices.resolve(preference: inputDevice)
+        FileHandle.standardError.write(Data(initialInput.logLine.utf8))
+        if initialInput.isFailure {
+            let available = AudioDevices.inputDevices().map { $0.name }
+            let hint = available.isEmpty
+                ? "  no input devices found.\n"
+                : "  available: \(available.joined(separator: ", "))\n"
+            FileHandle.standardError.write(Data(hint.utf8))
+        }
+        capture.primeInputSelection(initialInput)
+        capture.onInputChange = { selection in
+            FileHandle.standardError.write(Data(selection.logLine.utf8))
+        }
+
         let dumpWav = self.dumpWav
         let overlay: RecordingOverlay? = noOverlay ? nil : MainActor.assumeIsolated { RecordingOverlay() }
         if let overlay {
@@ -275,6 +318,9 @@ struct Doctor: ParsableCommand {
     @Option(name: .long, help: "Also check that this model is downloaded.")
     var model: String?
 
+    @Option(name: .customLong("input-device"), help: inputDeviceHelp)
+    var inputDevice: InputDevicePolicy.Preference = .auto
+
     func run() throws {
         var models: [TranscriptionModel] = []
         if bilingual {
@@ -293,7 +339,7 @@ struct Doctor: ParsableCommand {
         } else if let m = ModelRegistry.recommended() {
             models = [m]
         }
-        let checks = DoctorReport.run(models: models)
+        let checks = DoctorReport.run(models: models, inputPreference: inputDevice)
         DoctorReport.print(checks)
         if !DoctorReport.allOK(checks) {
             throw ExitCode(1)

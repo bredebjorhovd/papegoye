@@ -132,6 +132,8 @@ parrot --bilingual                     # per-utterance Norwegian/English routing
 parrot --bilingual --en-model whisper-base.en --en-threshold 0.7   # tweak routes
 parrot --hotkey right-option           # change the push-to-talk key
 parrot --no-overlay                    # disable the bottom-of-screen pill
+parrot --input-device "Shure MV7"      # record from a specific microphone
+parrot --input-device default          # record from the system default, Bluetooth and all
 parrot bench warmup                    # time single-model vs bilingual startup
 parrot bench lid                       # time language detection across utterance lengths
 ```

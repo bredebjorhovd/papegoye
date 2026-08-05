@@ -22,11 +22,48 @@ final class AudioCapture {
     /// Invoked on an arbitrary thread; hop to main if you touch UI.
     var onLevel: ((Float) -> Void)?
 
+    /// Which microphone to record from (gh#30).
+    var inputPreference: InputDevicePolicy.Preference = .auto
+
+    /// Called when the resolved input device changes — including the first
+    /// resolution, unless `primeInputSelection` already announced it.
+    var onInputChange: ((InputSelection) -> Void)?
+
+    private var lastSelection: InputSelection?
+
+    /// Record a selection the caller has already reported, so the first
+    /// `start()` doesn't say the same thing twice.
+    func primeInputSelection(_ selection: InputSelection) {
+        lastSelection = selection
+    }
+
     /// Begin recording. Idempotent — calling while already recording is a no-op.
     func start() throws {
         guard !isRecording else { return }
 
         let input = engine.inputNode
+
+        // Resolved fresh every time, not once at launch: a headset that
+        // connects mid-session becomes the system default the moment it pairs,
+        // and that is exactly the case we exist to route around.
+        let selection = AudioDevices.resolve(preference: inputPreference)
+        if selection != lastSelection {
+            lastSelection = selection
+            onInputChange?(selection)
+        }
+        if let device = selection.device {
+            do {
+                try input.auAudioUnit.setDeviceID(AUAudioObjectID(device.id))
+            } catch {
+                FileHandle.standardError.write(Data(
+                    "warning: couldn't select input \"\(device.name)\": \(error)\n".utf8
+                ))
+            }
+        }
+
+        // Read the format *after* choosing the device — an HFP headset reports
+        // 16 kHz mono where the built-in mic reports 48 kHz, and the converter
+        // has to be built for the device we actually end up on.
         let inputFormat = input.outputFormat(forBus: 0)
 
         let targetFormat = AVAudioFormat(

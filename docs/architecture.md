@@ -83,6 +83,18 @@ Global hotkey via `CGEventTap` (requires Accessibility permission). Default: **h
 
 `AVAudioEngine` tap on the input node. Streams 16 kHz mono `Float32` buffers into a ring buffer while the hotkey is held. On release, hands the full buffer to the active `Transcriber`.
 
+### `InputDevicePolicy` / `AudioDevices`
+
+Which microphone the tap opens is a decision, not a default (gh#30). Classic Bluetooth can't carry A2DP playback and a mic at once, so opening a connected headset's mic drops the whole link to HFP — 16 kHz mono, compressed, and audibly distorted for whatever was playing through it. That same HFP stream is also the worse input for Whisper, so the trade is lopsided in both directions.
+
+`AudioDevices` enumerates inputs over CoreAudio (`kAudioHardwarePropertyDevices`, `kAudioDevicePropertyTransportType`). `InputDevicePolicy` is the pure function over that list, in the same shape as `RoutingPolicy` and table-tested without hardware:
+
+- **auto** (default) — if the system default input is Bluetooth and any other real input exists, record from that one instead. Preference order is built-in > USB > everything else; virtual and aggregate devices are never auto-picked, because a silent mic is a worse failure than a compressed one.
+- **`--input-device <name>`** — record from a named device, Bluetooth included. Matched case-insensitively, exact name before prefix before substring.
+- **`--input-device default`** — plain system-default behaviour, for anyone who genuinely wants the headset mic.
+
+Resolution happens on every `start()`, not once at launch: a headset becomes the system default the moment it pairs, which is exactly the case being routed around. Every departure from the system default is announced on stderr (`○ input: … (skipped Bluetooth "AirPods" — would force HFP; …)`) and reported by `parrot doctor` — silently ignoring the user's chosen microphone would be its own bug.
+
 ### `Transcriber` (protocol)
 
 ```swift
@@ -258,6 +270,8 @@ parrot/
 
     Audio/
       AudioCapture.swift        # AVAudioEngine tap + ring buffer
+      AudioDevices.swift        # CoreAudio input enumeration
+      InputDevicePolicy.swift   # pure device selection (avoids Bluetooth mics)
 
     Input/
       HotkeyMonitor.swift       # CGEventTap
