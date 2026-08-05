@@ -15,7 +15,8 @@ final class InstallAgentTests: XCTestCase {
         noModel: String = BilingualConfiguration.defaultNorwegianModelID,
         enModel: String = BilingualConfiguration.defaultEnglishModelID,
         enThreshold: Float = RoutingPolicy.defaultEnglishThreshold,
-        noOverlay: Bool = false
+        noOverlay: Bool = false,
+        inputDevice: InputDevicePolicy.Preference = .auto
     ) -> [String] {
         Install.programArguments(
             binary: binary,
@@ -24,7 +25,8 @@ final class InstallAgentTests: XCTestCase {
             noModel: noModel,
             enModel: enModel,
             enThreshold: enThreshold,
-            noOverlay: noOverlay
+            noOverlay: noOverlay,
+            inputDevice: inputDevice
         )
     }
 
@@ -65,6 +67,21 @@ final class InstallAgentTests: XCTestCase {
         )
     }
 
+    func testInputDeviceIsForwardedOnlyWhenItIsntTheDefault() {
+        XCTAssertFalse(
+            arguments(inputDevice: .auto).contains("--input-device"),
+            "auto is the default, so the agent should track it rather than pin it"
+        )
+        XCTAssertEqual(
+            arguments(inputDevice: .systemDefault),
+            [binary, "run", "--skip-doctor", "--input-device", "default"]
+        )
+        XCTAssertEqual(
+            arguments(inputDevice: .named("Shure MV7")),
+            [binary, "run", "--skip-doctor", "--input-device", "Shure MV7"]
+        )
+    }
+
     /// The forwarded arguments are worthless if `parrot run` won't accept them
     /// at login, so parse them back through the real command.
     func testForwardedArgumentsParseAsRun() throws {
@@ -88,6 +105,36 @@ final class InstallAgentTests: XCTestCase {
         XCTAssertEqual(run.model, "whisper-large-v3-turbo")
         XCTAssertTrue(run.noOverlay)
         XCTAssertFalse(run.bilingual)
+    }
+
+    func testForwardedInputDeviceParsesAsRun() throws {
+        // A device name with a space is the normal case ("Shure MV7"), and it
+        // only survives the plist because ProgramArguments is a real array.
+        let args = arguments(inputDevice: .named("Shure MV7"))
+        let run = try Run.parse(Array(args.dropFirst(2)))
+        XCTAssertEqual(run.inputDevice, .named("Shure MV7"))
+
+        let asDefault = try Run.parse(
+            Array(arguments(inputDevice: .systemDefault).dropFirst(2))
+        )
+        XCTAssertEqual(asDefault.inputDevice, .systemDefault)
+    }
+
+    func testRunDefaultsToAvoidingBluetooth() throws {
+        XCTAssertEqual(try Run.parse([]).inputDevice, .auto)
+    }
+
+    func testInstallRejectsAnEmptyInputDevice() {
+        XCTAssertThrowsError(
+            try Install.parse(["--launch-at-login", "--input-device", "  "]),
+            "an empty name would silently mean 'auto'"
+        )
+    }
+
+    func testInputDeviceIsRejectedWithUninstall() {
+        XCTAssertThrowsError(
+            try Install.parse(["--uninstall", "--input-device", "default"])
+        )
     }
 
     // MARK: - EnvironmentVariables

@@ -39,6 +39,9 @@ struct Install: ParsableCommand {
     @Flag(name: .long, help: "Disable the on-screen recording overlay.")
     var noOverlay: Bool = false
 
+    @Option(name: .customLong("input-device"), help: inputDeviceHelp)
+    var inputDevice: InputDevicePolicy.Preference = .auto
+
     func validate() throws {
         if launchAtLogin == uninstall {
             throw ValidationError("specify exactly one of --launch-at-login or --uninstall")
@@ -88,6 +91,7 @@ struct Install: ParsableCommand {
         model == nil
             && !bilingual
             && !noOverlay
+            && inputDevice == .auto
             && noModel == BilingualConfiguration.defaultNorwegianModelID
             && enModel == BilingualConfiguration.defaultEnglishModelID
             && enThreshold == RoutingPolicy.defaultEnglishThreshold
@@ -116,7 +120,8 @@ struct Install: ParsableCommand {
         noModel: String,
         enModel: String,
         enThreshold: Float,
-        noOverlay: Bool
+        noOverlay: Bool,
+        inputDevice: InputDevicePolicy.Preference = .auto
     ) -> [String] {
         var args = [binary, "run", "--skip-doctor"]
         if let model {
@@ -136,6 +141,9 @@ struct Install: ParsableCommand {
         }
         if noOverlay {
             args.append("--no-overlay")
+        }
+        if let value = inputDevice.commandLineValue {
+            args += ["--input-device", value]
         }
         return args
     }
@@ -190,7 +198,8 @@ struct Install: ParsableCommand {
             noModel: noModel,
             enModel: enModel,
             enThreshold: enThreshold,
-            noOverlay: noOverlay
+            noOverlay: noOverlay,
+            inputDevice: inputDevice
         )
         let environment = Self.forwardedEnvironment(
             from: ProcessInfo.processInfo.environment
@@ -216,6 +225,22 @@ struct Install: ParsableCommand {
             FileHandle.standardError.write(Data(
                 "warning: launchctl bootstrap exited \(result.status):\n\(result.stderr)\n".utf8
             ))
+        }
+
+        // Same spirit as resolving model ids above: say now if the named mic
+        // isn't here. A warning rather than an error, because a USB mic that's
+        // unplugged at install time may well be plugged in at login.
+        if case .named(let requested) = inputDevice {
+            let selection = AudioDevices.resolve(preference: inputDevice)
+            if selection.isFailure {
+                let available = AudioDevices.inputDevices().map { $0.name }
+                var warning = "warning: no input device matches \"\(requested)\" right now"
+                if !available.isEmpty {
+                    warning += " (have: \(available.joined(separator: ", ")))"
+                }
+                warning += "\n  the agent falls back to the automatic pick until it appears.\n"
+                FileHandle.standardError.write(Data(warning.utf8))
+            }
         }
 
         print("✓ launch-at-login installed")
