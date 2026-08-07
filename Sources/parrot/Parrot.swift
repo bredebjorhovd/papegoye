@@ -117,7 +117,9 @@ struct Run: ParsableCommand {
             routing = r
             activeModels = config.models
             menuBarModelID = r.modelID
-            menuBarTitle = config.shortLabel
+            // Bird icon only, same as single-model mode — the pair of models is
+            // still named on the menu's `model:` line for anyone who wants it.
+            menuBarTitle = nil
             silenceFloor = Self.silenceRMSFloor
         } else {
             let chosenModel: TranscriptionModel
