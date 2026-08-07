@@ -7,5 +7,8 @@ build/
 *.xcworkspace
 .DS_Store
 
+# dev-loop logs (`... 2>&1 | tee .dev.log`)
+.dev*.log
+
 # kdb auto-rendered task index (regenerate with `kdb render`)
 .tasks/
