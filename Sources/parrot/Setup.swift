@@ -47,12 +47,15 @@ struct Setup: ParsableCommand {
         }
 
         let session = SessionKind.detect()
-        var record = store.load()
-        if !record.prompted, session == .gui {
+        let binary = BinaryIdentity.current()
+        if case .ask = AccessibilityPrompting.decide(
+            record: store.load(),
+            binary: binary,
+            session: session
+        ) {
             print("→ asking macOS for accessibility access...")
             AccessibilityTrust.requestPrompt()
-            store.notePrompted()
-            record.prompted = true
+            store.notePrompted(binary: binary)
             if AccessibilityTrust.waitForTrust(seconds: AccessibilityTrust.promptGrace) {
                 print("✓ accessibility granted")
                 store.noteGranted(subject: subject)
@@ -63,8 +66,8 @@ struct Setup: ParsableCommand {
 
         let diagnosis = AccessibilityDiagnosis.classify(
             trusted: false,
-            record: record,
-            binary: BinaryIdentity.current(),
+            record: store.load(),
+            binary: binary,
             session: session
         )
         for line in AccessibilityGuidance.instructions(for: diagnosis, subject: subject) {

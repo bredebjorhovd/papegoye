@@ -43,10 +43,21 @@ enum SessionKind: Equatable {
     case gui
     /// Remote login — the prompt would appear on a desktop nobody is looking at.
     case remote(host: String)
+    /// Started by launchd. Nobody typed the command, so nobody is waiting to
+    /// answer a modal dialog — and launchd restarts the job on failure, which
+    /// turns one prompt into a prompt every few seconds (gh#35).
+    case launchAgent
 
     /// SSH sets at least one of these on every login; `SSH_CONNECTION` carries
     /// "<client ip> <client port> <server ip> <server port>".
-    static func detect(environment: [String: String]) -> SessionKind {
+    static func detect(
+        environment: [String: String],
+        parentPID: pid_t = getppid(),
+        hasTerminal: Bool = isatty(STDERR_FILENO) == 1
+    ) -> SessionKind {
+        if isUnderLaunchd(environment: environment, parentPID: parentPID, hasTerminal: hasTerminal) {
+            return .launchAgent
+        }
         if let connection = environment["SSH_CONNECTION"], !connection.isEmpty {
             let client = connection.split(separator: " ").first.map(String.init)
             return .remote(host: client ?? "a remote host")
@@ -59,6 +70,30 @@ enum SessionKind: Equatable {
             return .remote(host: "a remote host")
         }
         return .gui
+    }
+
+    /// Three ways a launchd job can recognise itself, any one of which is
+    /// enough:
+    ///
+    /// - the marker `parrot install` bakes into its own plist — exact, but only
+    ///   present on agents this version installed;
+    /// - `XPC_SERVICE_NAME`, which launchd sets to the job label (a plain shell
+    ///   inherits "0" instead);
+    /// - being a child of pid 1 with no terminal, which is what a bootstrapped
+    ///   agent looks like from the inside when the first two are missing.
+    ///
+    /// The last one alone would also match a disowned background process, so it
+    /// needs both halves: a backgrounded `parrot run` keeps its tty.
+    static func isUnderLaunchd(
+        environment: [String: String],
+        parentPID: pid_t,
+        hasTerminal: Bool
+    ) -> Bool {
+        if environment[Install.launchdMarkerKey] == "1" { return true }
+        if let service = environment["XPC_SERVICE_NAME"], service.contains(Install.label) {
+            return true
+        }
+        return parentPID == 1 && !hasTerminal
     }
 
     static func detect() -> SessionKind {
@@ -181,8 +216,27 @@ struct AccessibilityRecord: Codable, Equatable {
     /// twice, so a second `false` from the AX API means "go to Settings", not
     /// "wait for a dialog".
     var prompted: Bool = false
+    /// Which binary the prompt was spent on. TCC keys an unsigned binary by
+    /// path and contents, so a replaced binary gets a fresh prompt — and this
+    /// is how parrot knows the difference between that and asking twice for the
+    /// same one.
+    var promptedBinary: BinaryIdentity?
     var grantedSubject: AccessibilitySubject?
     var grantedBinary: BinaryIdentity?
+
+    /// True when macOS's one-per-identity prompt has already been spent on this
+    /// exact binary — i.e. asking again would open a dialog for nothing, or
+    /// (worse, under launchd) once per restart.
+    ///
+    /// A record written before parrot tracked the identity has `prompted` but
+    /// no `promptedBinary`; so does a run that couldn't stat its own binary.
+    /// Both resolve to "already asked", because too few prompts costs a line of
+    /// text and too many is gh#35.
+    func hasPrompted(for binary: BinaryIdentity?) -> Bool {
+        guard prompted else { return false }
+        guard let promptedBinary, let binary else { return true }
+        return promptedBinary == binary
+    }
 }
 
 struct AccessibilityStore {
@@ -222,10 +276,14 @@ struct AccessibilityStore {
         try? data.write(to: fileURL, options: .atomic)
     }
 
-    func notePrompted() {
+    /// Records that the prompt has been spent, against the binary that spent
+    /// it. Written *before* waiting for an answer: a user who ignores the
+    /// dialog must not be asked again either.
+    func notePrompted(binary: BinaryIdentity? = BinaryIdentity.current()) {
         var record = load()
-        guard !record.prompted else { return }
+        guard !record.hasPrompted(for: binary) else { return }
         record.prompted = true
+        record.promptedBinary = binary
         save(record)
     }
 
@@ -233,11 +291,9 @@ struct AccessibilityStore {
     /// granted" from "granted, then the binary was replaced".
     func noteGranted(subject: AccessibilitySubject, binary: BinaryIdentity? = BinaryIdentity.current()) {
         let record = load()
-        let updated = AccessibilityRecord(
-            prompted: record.prompted,
-            grantedSubject: subject,
-            grantedBinary: binary
-        )
+        var updated = record
+        updated.grantedSubject = subject
+        updated.grantedBinary = binary
         guard updated != record else { return }
         save(updated)
     }
@@ -264,10 +320,17 @@ enum AccessibilityDiagnosis: Equatable {
         session: SessionKind
     ) -> AccessibilityDiagnosis {
         if trusted { return .granted }
-        if case .remote(let host) = session {
+        switch session {
+        case .remote(let host):
             return .cannotPrompt(
                 reason: "this is an SSH session from \(host); macOS only shows the prompt on the local desktop"
             )
+        case .launchAgent:
+            return .cannotPrompt(
+                reason: "launchd started parrot, and a background agent has no interactive session to show a dialog in"
+            )
+        case .gui:
+            break
         }
         // Only meaningful when the grant was on parrot's own binary: a grant on
         // the terminal survives parrot upgrades untouched.
@@ -278,8 +341,48 @@ enum AccessibilityDiagnosis: Equatable {
         {
             return .revokedAfterUpgrade(previous: previous)
         }
-        if record.prompted { return .promptAlreadySpent }
+        if record.hasPrompted(for: binary) { return .promptAlreadySpent }
         return .notYetPrompted
+    }
+}
+
+/// The single decision about whether parrot may put a modal dialog on screen.
+///
+/// Every `AXIsProcessTrustedWithOptions([prompt: true])` can open one, and the
+/// daemon used to make that call once per start. Under
+/// `KeepAlive {SuccessfulExit: false}` a failing start is followed by another
+/// start, so one missing grant became a dialog every few seconds (gh#35). The
+/// decision therefore reads state that outlives the process, and is made in one
+/// place that both `run` and `setup` go through.
+enum AccessibilityPrompting {
+    enum Decision: Equatable {
+        /// Ask macOS to show the prompt, then write the record.
+        case ask
+        /// Check trust silently and say why there will be no dialog.
+        case doNotAsk(Reason)
+    }
+
+    enum Reason: Equatable {
+        case underLaunchd
+        case remote(host: String)
+        case alreadyAskedForThisBinary
+    }
+
+    static func decide(
+        record: AccessibilityRecord,
+        binary: BinaryIdentity?,
+        session: SessionKind
+    ) -> Decision {
+        switch session {
+        case .launchAgent:
+            return .doNotAsk(.underLaunchd)
+        case .remote(let host):
+            return .doNotAsk(.remote(host: host))
+        case .gui:
+            break
+        }
+        if record.hasPrompted(for: binary) { return .doNotAsk(.alreadyAskedForThisBinary) }
+        return .ask
     }
 }
 
@@ -370,6 +473,40 @@ enum AccessibilityGuidance {
         }
         lines.append("  2. \(settingsPath)")
         return lines
+    }
+
+    /// What `parrot run` writes to stderr when it can't tap the keyboard.
+    ///
+    /// Under launchd this is the whole user-visible artefact of the failure —
+    /// /tmp/parrot.err.log is the only place it lands — so it has to say what
+    /// is wrong, what to do, and why parrot is not going to try again.
+    static func daemonFailure(
+        for diagnosis: AccessibilityDiagnosis,
+        subject: AccessibilitySubject,
+        session: SessionKind
+    ) -> [String] {
+        var lines = ["accessibility not granted — parrot can't watch the Fn key or type at the cursor."]
+        lines.append("  \(summary(for: diagnosis))")
+        if let remediation = remediation(for: diagnosis, subject: subject) {
+            lines.append("  → \(remediation)")
+        }
+        if session == .launchAgent {
+            // Exiting 0 is the mechanism; saying so is the point. Anyone
+            // reading this log is looking at a daemon that quietly isn't there.
+            lines.append("  exiting cleanly so launchd doesn't restart the loop — a permission")
+            lines.append("  can't be granted by trying again, and each retry reloads the models.")
+            lines.append("  once it's granted: launchctl kickstart -k gui/$(id -u)/\(Install.label)")
+        } else {
+            lines.append("  run `parrot setup` to sort it out.")
+        }
+        return lines
+    }
+
+    /// A missing grant is not transient, so under launchd parrot exits 0: with
+    /// `KeepAlive {SuccessfulExit: false}` that is the exit status that means
+    /// "leave me alone". In a terminal the failure is still a failure.
+    static func daemonExitCode(for session: SessionKind) -> Int32 {
+        session == .launchAgent ? 0 : 1
     }
 
     private static func enableClause(_ subject: AccessibilitySubject) -> String {

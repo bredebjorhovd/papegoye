@@ -97,6 +97,186 @@ final class AccessibilityTests: XCTestCase {
         XCTAssertEqual(SessionKind.detect(environment: ["SSH_CONNECTION": ""]), .gui)
     }
 
+    // MARK: - Running under launchd (gh#35)
+
+    private func detect(
+        _ environment: [String: String],
+        parentPID: pid_t = 4_242,
+        hasTerminal: Bool = true
+    ) -> SessionKind {
+        SessionKind.detect(environment: environment, parentPID: parentPID, hasTerminal: hasTerminal)
+    }
+
+    func testTheMarkerInOurOwnPlistIsEnoughToRecogniseLaunchd() {
+        XCTAssertEqual(detect([Install.launchdMarkerKey: "1"]), .launchAgent)
+    }
+
+    func testLaunchdIsRecognisedFromTheJobLabelItExports() {
+        XCTAssertEqual(detect(["XPC_SERVICE_NAME": Install.label]), .launchAgent)
+    }
+
+    /// Agents installed before the marker existed have neither it nor, on some
+    /// macOS versions, a useful XPC_SERVICE_NAME — but they are always a child
+    /// of launchd with their output redirected to a log file.
+    func testAnOlderAgentIsRecognisedByItsParentAndMissingTerminal() {
+        XCTAssertEqual(detect([:], parentPID: 1, hasTerminal: false), .launchAgent)
+    }
+
+    func testATerminalSessionIsNeverMistakenForLaunchd() {
+        // XPC_SERVICE_NAME is "0" in a normal login shell, and a pipeline
+        // (`parrot run | tee`) has no tty while still being a terminal session.
+        XCTAssertEqual(detect(["XPC_SERVICE_NAME": "0"]), .gui)
+        XCTAssertEqual(detect([:], parentPID: 900, hasTerminal: false), .gui)
+        XCTAssertEqual(detect([:], parentPID: 1, hasTerminal: true), .gui)
+    }
+
+    /// launchd wins over the SSH variables: an agent bootstrapped from an ssh
+    /// session inherits neither an answerable dialog nor the ssh environment's
+    /// meaning.
+    func testLaunchdOutranksSSHDetection() {
+        XCTAssertEqual(
+            detect([
+                Install.launchdMarkerKey: "1",
+                "SSH_CONNECTION": "10.0.0.2 51000 10.0.0.9 22",
+            ]),
+            .launchAgent
+        )
+    }
+
+    func testDaemonSessionCannotPrompt() {
+        let diagnosis = classify(session: .launchAgent)
+        guard case .cannotPrompt(let reason) = diagnosis else {
+            return XCTFail("expected cannotPrompt, got \(diagnosis)")
+        }
+        XCTAssertTrue(reason.contains("launchd"))
+    }
+
+    // MARK: - Whether to open a dialog at all (gh#35)
+
+    private func decide(
+        record: AccessibilityRecord = AccessibilityRecord(),
+        binary: BinaryIdentity? = BinaryIdentity(path: "/usr/local/bin/parrot", fingerprint: "100-2"),
+        session: SessionKind = .gui
+    ) -> AccessibilityPrompting.Decision {
+        AccessibilityPrompting.decide(record: record, binary: binary, session: session)
+    }
+
+    func testFirstRunInATerminalMayAsk() {
+        XCTAssertEqual(decide(), .ask)
+    }
+
+    /// The bug: the daemon asked on every start, and launchd restarts it on
+    /// every failure. Nothing about a background agent may open a dialog.
+    func testADaemonNeverAsksEvenOnAVirginRecord() {
+        XCTAssertEqual(decide(session: .launchAgent), .doNotAsk(.underLaunchd))
+    }
+
+    func testARemoteSessionNeverAsks() {
+        XCTAssertEqual(
+            decide(session: .remote(host: "10.0.0.2")),
+            .doNotAsk(.remote(host: "10.0.0.2"))
+        )
+    }
+
+    func testTheSecondStartOfTheSameBinaryDoesNotAsk() {
+        let binary = BinaryIdentity(path: "/usr/local/bin/parrot", fingerprint: "100-2")
+        let record = AccessibilityRecord(prompted: true, promptedBinary: binary)
+        XCTAssertEqual(decide(record: record, binary: binary), .doNotAsk(.alreadyAskedForThisBinary))
+    }
+
+    /// A replaced binary is a new client to TCC, so its prompt is available
+    /// again — once.
+    func testAReplacedBinaryEarnsOneFreshPrompt() {
+        let record = AccessibilityRecord(
+            prompted: true,
+            promptedBinary: BinaryIdentity(path: "/usr/local/bin/parrot", fingerprint: "100-1")
+        )
+        XCTAssertEqual(
+            decide(record: record, binary: BinaryIdentity(path: "/usr/local/bin/parrot", fingerprint: "100-2")),
+            .ask
+        )
+    }
+
+    /// A record written before parrot tracked the identity, and a run that
+    /// can't stat its own binary, both have to mean "don't ask": guessing wrong
+    /// in the other direction is the prompt storm.
+    func testAnUnattributedPromptCountsAsSpent() {
+        XCTAssertEqual(
+            decide(record: AccessibilityRecord(prompted: true)),
+            .doNotAsk(.alreadyAskedForThisBinary)
+        )
+        let record = AccessibilityRecord(
+            prompted: true,
+            promptedBinary: BinaryIdentity(path: "/usr/local/bin/parrot", fingerprint: "100-1")
+        )
+        XCTAssertEqual(decide(record: record, binary: nil), .doNotAsk(.alreadyAskedForThisBinary))
+    }
+
+    /// The regression in one test: seventeen restarts of the same binary, one
+    /// dialog. The record is the only thing that survives between them, so the
+    /// store has to be in the loop.
+    func testARestartLoopProducesExactlyOnePrompt() throws {
+        let store = try temporaryStore()
+        let binary = BinaryIdentity(path: "/usr/local/bin/parrot", fingerprint: "100-2")
+        var asked = 0
+        for _ in 0..<17 {
+            if case .ask = AccessibilityPrompting.decide(
+                record: store.load(),
+                binary: binary,
+                session: .gui
+            ) {
+                asked += 1
+                store.notePrompted(binary: binary)
+            }
+        }
+        XCTAssertEqual(asked, 1)
+    }
+
+    func testARestartLoopUnderLaunchdPromptsNotAtAll() throws {
+        let store = try temporaryStore()
+        let binary = BinaryIdentity(path: "/usr/local/bin/parrot", fingerprint: "100-2")
+        for _ in 0..<17 {
+            XCTAssertEqual(
+                AccessibilityPrompting.decide(record: store.load(), binary: binary, session: .launchAgent),
+                .doNotAsk(.underLaunchd)
+            )
+        }
+        XCTAssertFalse(store.load().prompted, "nothing was asked, so nothing was spent")
+    }
+
+    // MARK: - What the daemon says and how it exits (gh#35)
+
+    /// A missing permission is not transient: with
+    /// `KeepAlive {SuccessfulExit: false}`, exiting 0 is how the daemon tells
+    /// launchd to stop trying.
+    func testTheDaemonExitsZeroSoLaunchdLeavesItAlone() {
+        XCTAssertEqual(AccessibilityGuidance.daemonExitCode(for: .launchAgent), 0)
+        XCTAssertEqual(AccessibilityGuidance.daemonExitCode(for: .gui), 1)
+        XCTAssertEqual(AccessibilityGuidance.daemonExitCode(for: .remote(host: "x")), 1)
+    }
+
+    func testDaemonFailureExplainsWhyItIsNotRetrying() {
+        let lines = AccessibilityGuidance.daemonFailure(
+            for: .cannotPrompt(reason: "launchd started parrot"),
+            subject: ownBinary,
+            session: .launchAgent
+        ).joined(separator: "\n")
+        XCTAssertTrue(lines.contains("accessibility not granted"))
+        XCTAssertTrue(lines.contains("/usr/local/bin/parrot"), "the entry to add has to be named")
+        XCTAssertTrue(lines.contains("launchd doesn't restart"), "silence needs explaining")
+        XCTAssertTrue(lines.contains("kickstart"), "and so does how to start it again afterwards")
+    }
+
+    func testDaemonFailureInATerminalPointsAtSetup() {
+        let lines = AccessibilityGuidance.daemonFailure(
+            for: .notYetPrompted,
+            subject: ghostty,
+            session: .gui
+        ).joined(separator: "\n")
+        XCTAssertTrue(lines.contains("parrot setup"))
+        XCTAssertFalse(lines.contains("kickstart"), "no agent is involved when a human ran it")
+    }
+
     // MARK: - Diagnosis
 
     private func classify(
@@ -284,6 +464,105 @@ final class AccessibilityTests: XCTestCase {
         XCTAssertTrue(check.remediation?.contains("/usr/local/bin/parrot") ?? false)
     }
 
+    // MARK: - doctor on the LaunchAgent (gh#35)
+
+    func testLaunchctlListIsParsedIntoRunningAndStoppedStates() {
+        let output = """
+            -\t0\tcom.apple.SafariHistoryServiceAgent
+            4711\t0\tcom.digimata.parrot
+            -\t1\tcom.example.other
+            """
+        XCTAssertEqual(
+            LaunchAgentInspector.parse(list: output),
+            LaunchAgentState(pid: 4_711, lastExitStatus: 0)
+        )
+        XCTAssertTrue(LaunchAgentInspector.parse(list: output)?.isRunning ?? false)
+
+        let failing = "-\t1\tcom.digimata.parrot"
+        XCTAssertEqual(
+            LaunchAgentInspector.parse(list: failing),
+            LaunchAgentState(pid: nil, lastExitStatus: 1)
+        )
+        XCTAssertFalse(LaunchAgentInspector.parse(list: failing)?.isRunning ?? true)
+    }
+
+    func testAnUnlistedLabelParsesAsNothing() {
+        XCTAssertNil(LaunchAgentInspector.parse(list: "-\t0\tcom.example.other"))
+        XCTAssertNil(LaunchAgentInspector.parse(list: ""))
+        XCTAssertNil(
+            LaunchAgentInspector.parse(list: "-\t0\tcom.digimata.parrot.helper"),
+            "a longer label that merely starts the same is a different job"
+        )
+    }
+
+    /// The pre-fix state, which is what a user upgrading into this version has
+    /// on disk: a nonzero exit and launchd putting it straight back.
+    func testDoctorNamesThePermissionRestartLoop() {
+        let check = DoctorReport.check(
+            forAgent: LaunchAgentState(pid: nil, lastExitStatus: 1),
+            accessibility: .promptAlreadySpent,
+            subject: ghostty
+        )
+        guard case .fail(let message) = check.status else {
+            return XCTFail("expected a failure, got \(check.status)")
+        }
+        XCTAssertTrue(message.contains("not running"))
+        XCTAssertTrue(message.contains("launchd keeps restarting it"), "the loop is the symptom to name")
+        XCTAssertTrue(check.remediation?.contains("enable Ghostty") ?? false)
+        XCTAssertTrue(check.remediation?.contains("kickstart") ?? false)
+    }
+
+    /// The post-fix state: parrot stopped on purpose, so nothing is looping and
+    /// nothing will happen until someone grants the permission and reloads it.
+    func testDoctorExplainsADaemonThatStoppedItself() {
+        let check = DoctorReport.check(
+            forAgent: LaunchAgentState(pid: nil, lastExitStatus: 0),
+            accessibility: .promptAlreadySpent,
+            subject: ownBinary
+        )
+        guard case .fail(let message) = check.status else {
+            return XCTFail("expected a failure, got \(check.status)")
+        }
+        XCTAssertTrue(message.contains("accessibility isn't granted"))
+        XCTAssertTrue(check.remediation?.contains("kickstart") ?? false)
+    }
+
+    func testDoctorReportsAHealthyAgentWithItsPID() {
+        let check = DoctorReport.check(
+            forAgent: LaunchAgentState(pid: 4_711, lastExitStatus: 0),
+            accessibility: .granted,
+            subject: ownBinary
+        )
+        guard case .ok = check.status else {
+            return XCTFail("expected ok, got \(check.status)")
+        }
+        XCTAssertEqual(check.detail, "running (pid 4711)")
+    }
+
+    /// A stopped agent with the grant in place is a different problem, and must
+    /// not be blamed on permissions.
+    func testDoctorSendsANonPermissionFailureToTheLog() {
+        let check = DoctorReport.check(
+            forAgent: LaunchAgentState(pid: nil, lastExitStatus: 78),
+            accessibility: .granted,
+            subject: ownBinary
+        )
+        guard case .fail(let message) = check.status else {
+            return XCTFail("expected a failure, got \(check.status)")
+        }
+        XCTAssertTrue(message.contains("78"))
+        XCTAssertTrue(check.remediation?.contains("/tmp/parrot.err.log") ?? false)
+    }
+
+    func testDoctorFlagsAPlistThatWasNeverLoaded() {
+        let check = DoctorReport.check(forAgent: nil, accessibility: .granted, subject: ownBinary)
+        guard case .warn(let message) = check.status else {
+            return XCTFail("expected a warning, got \(check.status)")
+        }
+        XCTAssertTrue(message.contains("not loaded"))
+        XCTAssertTrue(check.remediation?.contains("--launch-at-login") ?? false)
+    }
+
     func testDoctorPassesWhenGranted() {
         let check = DoctorReport.check(for: .granted, subject: ghostty)
         guard case .ok = check.status else {
@@ -317,6 +596,44 @@ final class AccessibilityTests: XCTestCase {
         XCTAssertTrue(record.prompted, "recording a grant must not forget that we prompted")
         XCTAssertEqual(record.grantedSubject, ownBinary)
         XCTAssertEqual(record.grantedBinary, identity)
+    }
+
+    func testThePromptIsRememberedAgainstTheBinaryThatSpentIt() throws {
+        let store = try temporaryStore()
+        let first = BinaryIdentity(path: "/usr/local/bin/parrot", fingerprint: "100-1")
+        store.notePrompted(binary: first)
+        XCTAssertEqual(store.load().promptedBinary, first)
+
+        let upgraded = BinaryIdentity(path: "/usr/local/bin/parrot", fingerprint: "100-2")
+        XCTAssertFalse(
+            store.load().hasPrompted(for: upgraded),
+            "an upgraded binary is a new client to TCC, and gets its own prompt"
+        )
+        store.notePrompted(binary: upgraded)
+        XCTAssertEqual(store.load().promptedBinary, upgraded)
+        XCTAssertTrue(store.load().hasPrompted(for: upgraded))
+    }
+
+    func testRecordingAGrantKeepsWhichBinaryWasPrompted() throws {
+        let store = try temporaryStore()
+        let binary = BinaryIdentity(path: "/usr/local/bin/parrot", fingerprint: "100-1")
+        store.notePrompted(binary: binary)
+        store.noteGranted(subject: ownBinary, binary: binary)
+        XCTAssertEqual(store.load().promptedBinary, binary, "a grant must not reopen the prompt budget")
+    }
+
+    /// Records written by gh#31's version have `prompted` and nothing else.
+    func testALegacyRecordStillDecodes() throws {
+        let store = try temporaryStore()
+        try FileManager.default.createDirectory(at: store.directory, withIntermediateDirectories: true)
+        try Data(#"{"prompted":true}"#.utf8).write(to: store.fileURL)
+        let record = store.load()
+        XCTAssertTrue(record.prompted)
+        XCTAssertNil(record.promptedBinary)
+        XCTAssertTrue(
+            record.hasPrompted(for: BinaryIdentity(path: "/usr/local/bin/parrot", fingerprint: "100-1")),
+            "unknown provenance has to read as spent, or the storm comes back"
+        )
     }
 
     func testCorruptRecordDegradesToDefaults() throws {

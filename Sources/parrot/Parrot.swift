@@ -44,7 +44,17 @@ struct Run: ParsableCommand {
     /// skipped before LID — language detection on silence is meaningless.
     static let silenceRMSFloor: Float = 0.003
 
-    @Flag(name: .long, help: "Skip permission checks at startup.")
+    @Flag(
+        name: .long,
+        help: ArgumentHelp(
+            "Skip the startup doctor report.",
+            discussion: """
+                Accessibility is still checked: without it there is no hotkey \
+                tap and nothing else parrot does can matter, so failing before \
+                a gigabyte of models loads is the only sensible order.
+                """
+        )
+    )
     var skipDoctor: Bool = false
 
     @Flag(name: .long, help: "Print every keyboard event the tap sees (debug).")
@@ -91,7 +101,58 @@ struct Run: ParsableCommand {
         }
     }
 
+    /// Settle the Accessibility question before anything expensive happens.
+    ///
+    /// Without the grant the hotkey tap can't be created and the daemon is
+    /// useless, so discovering it after warm-up means a gigabyte of models
+    /// loaded for nothing — once per launchd restart (gh#35). Prompting is a
+    /// decision made here, once, from a record that outlives the process:
+    /// asking on every start is what turned one dialog into seventeen.
+    private func ensureAccessibility(session: SessionKind) throws {
+        let store = AccessibilityStore.shared
+        let subject = AccessibilitySubjectResolver.resolve()
+
+        if AccessibilityTrust.isTrusted() {
+            store.noteGranted(subject: subject)
+            return
+        }
+
+        let binary = BinaryIdentity.current()
+        if case .ask = AccessibilityPrompting.decide(
+            record: store.load(),
+            binary: binary,
+            session: session
+        ) {
+            FileHandle.standardError.write(Data("asking macOS for accessibility access...\n".utf8))
+            AccessibilityTrust.requestPrompt()
+            // Recorded before waiting: a dialog the user walks away from is
+            // still a spent prompt, and must not be reopened by the next start.
+            store.notePrompted(binary: binary)
+            if AccessibilityTrust.waitForTrust(seconds: AccessibilityTrust.promptGrace) {
+                store.noteGranted(subject: subject)
+                return
+            }
+        }
+
+        let diagnosis = AccessibilityDiagnosis.classify(
+            trusted: false,
+            record: store.load(),
+            binary: binary,
+            session: session
+        )
+        let lines = AccessibilityGuidance.daemonFailure(
+            for: diagnosis,
+            subject: subject,
+            session: session
+        )
+        FileHandle.standardError.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+        throw ExitCode(AccessibilityGuidance.daemonExitCode(for: session))
+    }
+
     func run() throws {
+        let session = SessionKind.detect()
+        try ensureAccessibility(session: session)
+
         // Resolve models first so doctor can check they're downloaded.
         let transcriber: any Transcriber
         let routing: RoutingTranscriber?
@@ -291,8 +352,26 @@ struct Run: ParsableCommand {
             }
         } catch {
             FileHandle.standardError.write(Data("failed to register hotkey tap: \(error)\n".utf8))
-            FileHandle.standardError.write(Data("run `parrot setup` to configure permissions.\n".utf8))
-            throw ExitCode(1)
+            // The gate above already settled permissions, so reaching here
+            // normally means something else went wrong — but the grant can also
+            // be revoked in the seconds between. Restarting fixes neither, and
+            // under launchd it would loop, so exit the same way either way.
+            if !AccessibilityTrust.isTrusted() {
+                let lines = AccessibilityGuidance.daemonFailure(
+                    for: AccessibilityDiagnosis.classify(
+                        trusted: false,
+                        record: AccessibilityStore.shared.load(),
+                        binary: BinaryIdentity.current(),
+                        session: session
+                    ),
+                    subject: AccessibilitySubjectResolver.resolve(),
+                    session: session
+                )
+                FileHandle.standardError.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+            } else {
+                FileHandle.standardError.write(Data("run `parrot setup` to configure permissions.\n".utf8))
+            }
+            throw ExitCode(AccessibilityGuidance.daemonExitCode(for: session))
         }
 
         let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: .main)
@@ -341,7 +420,11 @@ struct Doctor: ParsableCommand {
         } else if let m = ModelRegistry.recommended() {
             models = [m]
         }
-        let checks = DoctorReport.run(models: models, inputPreference: inputDevice)
+        let checks = DoctorReport.run(
+            models: models,
+            inputPreference: inputDevice,
+            includeAgent: true
+        )
         DoctorReport.print(checks)
         if !DoctorReport.allOK(checks) {
             throw ExitCode(1)

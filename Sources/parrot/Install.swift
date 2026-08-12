@@ -109,6 +109,11 @@ struct Install: ParsableCommand {
     /// plist at install time or the Norwegian route can't warm up.
     static let forwardedEnvironmentKeys = ["PARROT_NB_MODEL_FOLDER"]
 
+    /// How the daemon recognises that launchd started it (gh#35). Detection
+    /// also has heuristics for agents installed by older versions, but a plain
+    /// marker in our own plist is the one that can't be wrong.
+    static let launchdMarkerKey = "PARROT_UNDER_LAUNCHD"
+
     /// The arguments the agent runs with: `run --skip-doctor` plus whatever
     /// run flags `install` was invoked with. Only non-default values are
     /// forwarded, so the agent tracks parrot's defaults the way a bare
@@ -159,6 +164,14 @@ struct Install: ParsableCommand {
         return captured
     }
 
+    /// Everything the plist's `EnvironmentVariables` holds: what was worth
+    /// capturing from this shell, plus parrot's own marker.
+    static func agentEnvironment(from environment: [String: String]) -> [String: String] {
+        var captured = forwardedEnvironment(from: environment)
+        captured[launchdMarkerKey] = "1"
+        return captured
+    }
+
     static func makePlist(
         arguments: [String],
         environment: [String: String]
@@ -201,9 +214,10 @@ struct Install: ParsableCommand {
             noOverlay: noOverlay,
             inputDevice: inputDevice
         )
-        let environment = Self.forwardedEnvironment(
+        let shellEnvironment = Self.forwardedEnvironment(
             from: ProcessInfo.processInfo.environment
         )
+        let environment = Self.agentEnvironment(from: ProcessInfo.processInfo.environment)
         let plist = Self.makePlist(arguments: arguments, environment: environment)
 
         let url = plistURL
@@ -247,12 +261,12 @@ struct Install: ParsableCommand {
         print("  plist:  \(url.path)")
         print("  binary: \(binary)")
         print("  args:   \(arguments.dropFirst().joined(separator: " "))")
-        if environment.isEmpty {
+        if shellEnvironment.isEmpty {
             print("  env:    none")
         } else {
             // Say out loud what got baked in — a plist that silently captured
             // a path from one shell is worse than one that announces it.
-            for (key, value) in environment.sorted(by: { $0.key < $1.key }) {
+            for (key, value) in shellEnvironment.sorted(by: { $0.key < $1.key }) {
                 print("  env:    \(key)=\(value)")
                 if !FileManager.default.fileExists(atPath: value) {
                     FileHandle.standardError.write(Data(
@@ -262,6 +276,7 @@ struct Install: ParsableCommand {
             }
             print("  (baked in from this shell; re-run `parrot install` after moving the model)")
         }
+        print("  env:    \(Self.launchdMarkerKey)=1 (so the daemon never opens a permission dialog)")
         print("  logs:   /tmp/parrot.out.log, /tmp/parrot.err.log")
     }
 
