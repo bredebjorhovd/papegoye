@@ -22,9 +22,13 @@ enum DoctorReport {
     /// `models` — the active configuration's model set (three in bilingual
     /// mode). Missing downloads are a warning, not a failure: warmup will
     /// download them, but on a slow link you'd rather know up front.
+    /// `includeAgent` is off for `run`'s own startup checks: a foreground
+    /// `parrot run` is a perfectly good reason for the LaunchAgent not to be
+    /// running, and shouldn't be blocked by it.
     static func run(
         models: [TranscriptionModel] = [],
-        inputPreference: InputDevicePolicy.Preference = .auto
+        inputPreference: InputDevicePolicy.Preference = .auto,
+        includeAgent: Bool = false
     ) -> [Check] {
         var checks = [
             checkMicrophone(),
@@ -33,6 +37,9 @@ enum DoctorReport {
             checkFnKeyMapping(),
             checkModelCacheLocation(),
         ]
+        if includeAgent, let agent = checkLaunchAgent() {
+            checks.append(agent)
+        }
         for m in models {
             checks.append(checkModelDownloaded(m))
         }
@@ -64,6 +71,76 @@ enum DoctorReport {
             name: name,
             status: .warn("in an iCloud-synced folder: \(legacy.path)\(evictionNote)"),
             remediation: "parrot models migrate — moves it to \(ModelCache.applicationSupportBase.appendingPathComponent("models").path)"
+        )
+    }
+
+    /// nil when there is no LaunchAgent installed — most people run parrot from
+    /// a terminal, and a row about something they never installed is noise.
+    static func checkLaunchAgent(store: AccessibilityStore = .shared) -> Check? {
+        guard LaunchAgentInspector.isInstalled() else { return nil }
+        let subject = AccessibilitySubjectResolver.resolve()
+        let diagnosis = AccessibilityDiagnosis.classify(
+            trusted: AccessibilityTrust.isTrusted(),
+            record: store.load(),
+            binary: BinaryIdentity.current(),
+            session: SessionKind.detect()
+        )
+        return check(
+            forAgent: LaunchAgentInspector.state(),
+            accessibility: diagnosis,
+            subject: subject
+        )
+    }
+
+    /// Pure mapping from launchd's view of the agent to a reported check.
+    ///
+    /// The case worth naming out loud is an agent that isn't running while the
+    /// Accessibility grant is missing: before gh#35 that was a restart loop
+    /// throwing a dialog every few seconds, and after it a daemon that has
+    /// stopped on purpose. Either way nothing about it is self-explanatory.
+    static func check(
+        forAgent state: LaunchAgentState?,
+        accessibility: AccessibilityDiagnosis,
+        subject: AccessibilitySubject
+    ) -> Check {
+        let name = "launch agent"
+        guard let state else {
+            return Check(
+                name: name,
+                status: .warn("installed but not loaded"),
+                remediation: "re-run `parrot install --launch-at-login` to load it"
+            )
+        }
+        if let pid = state.pid {
+            return Check(name: name, status: .ok, remediation: nil, detail: "running (pid \(pid))")
+        }
+
+        let permissionRemedy = AccessibilityGuidance.remediation(for: accessibility, subject: subject)
+        let reload = "then reload it: launchctl kickstart -k gui/$(id -u)/\(Install.label)"
+
+        if accessibility != .granted {
+            let exited = state.lastExitStatus ?? 0
+            let status: CheckStatus = exited == 0
+                ? .fail("not running — it stops at startup because accessibility isn't granted")
+                : .fail("not running — it exits \(exited) at startup and launchd keeps restarting it")
+            return Check(
+                name: name,
+                status: status,
+                remediation: [permissionRemedy, reload].compactMap { $0 }.joined(separator: "; ")
+            )
+        }
+
+        if let exited = state.lastExitStatus, exited != 0 {
+            return Check(
+                name: name,
+                status: .fail("not running — last exit \(exited)"),
+                remediation: "see /tmp/parrot.err.log for why; \(reload)"
+            )
+        }
+        return Check(
+            name: name,
+            status: .warn("installed but not running"),
+            remediation: "see /tmp/parrot.err.log; \(reload)"
         )
     }
 

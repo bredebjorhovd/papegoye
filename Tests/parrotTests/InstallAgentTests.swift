@@ -158,6 +158,35 @@ final class InstallAgentTests: XCTestCase {
         )
     }
 
+    /// The daemon must know it was started by launchd so it never opens a
+    /// permission dialog nobody can answer (gh#35). Detection has heuristics
+    /// for older agents, but this marker is the one that can't be wrong.
+    func testTheAgentEnvironmentMarksItselfAsLaunchd() {
+        XCTAssertEqual(
+            Install.agentEnvironment(from: [:]),
+            [Install.launchdMarkerKey: "1"]
+        )
+        XCTAssertEqual(
+            Install.agentEnvironment(from: ["PARROT_NB_MODEL_FOLDER": "/Users/x/models/nb"]),
+            [
+                "PARROT_NB_MODEL_FOLDER": "/Users/x/models/nb",
+                Install.launchdMarkerKey: "1",
+            ]
+        )
+    }
+
+    func testTheInstalledMarkerIsWhatTheDaemonLooksFor() {
+        XCTAssertEqual(
+            SessionKind.detect(
+                environment: Install.agentEnvironment(from: [:]),
+                parentPID: 4_242,
+                hasTerminal: true
+            ),
+            .launchAgent,
+            "the plist and the detector have to agree, or the storm comes back"
+        )
+    }
+
     // MARK: - Plist
 
     func testPlistOmitsEnvironmentVariablesWhenNothingWasCaptured() {

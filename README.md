@@ -111,6 +111,17 @@ move the model and you have to re-run `parrot install --launch-at-login`.
 > every other model, nothing needs `EnvironmentVariables` and you can install
 > without it.
 
+The agent never opens a permission dialog: nobody typed the command, so nobody
+is waiting to answer one. If Accessibility is missing — most often after an
+upgrade replaced the binary — the daemon says so in `/tmp/parrot.err.log` and
+**stops**, rather than letting launchd restart it into a permission it cannot
+obtain by retrying. `parrot doctor` reports that state under `launch agent`.
+Grant it from a terminal with `parrot setup`, then start the agent again:
+
+```sh
+launchctl kickstart -k gui/$(id -u)/com.digimata.parrot
+```
+
 ## How to use
 
 1. **Run it.** Either `parrot install --launch-at-login` (daemonized, runs forever, lives in the menu bar), or `parrot` in any terminal tab.

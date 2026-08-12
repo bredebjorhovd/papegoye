@@ -8,7 +8,10 @@ import Foundation
 /// will see an error from `start()`.
 final class HotkeyMonitor {
     enum Event { case pressed, released }
-    enum HotkeyError: Error { case tapCreateFailed }
+    enum HotkeyError: Error {
+        case accessibilityNotGranted
+        case tapCreateFailed
+    }
 
     /// Mask of the modifier we treat as the hotkey. Fn = `.maskSecondaryFn`.
     private let mask: CGEventFlags
@@ -26,13 +29,12 @@ final class HotkeyMonitor {
     func start(onEvent: @escaping (Event) -> Void) throws {
         self.onEvent = onEvent
 
-        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        let trusted = AXIsProcessTrustedWithOptions([promptKey: true] as CFDictionary)
-        if !trusted {
-            FileHandle.standardError.write(Data(
-                "accessibility not granted — system prompt opened. Grant access, then quit and relaunch parrot.\n".utf8
-            ))
-            throw HotkeyError.tapCreateFailed
+        // Deliberately the silent check: `AXIsProcessTrustedWithOptions` with
+        // the prompt option opens a dialog on every call, and this one runs on
+        // every daemon start (gh#35). Whether a prompt is appropriate is
+        // decided once, by the caller, before it gets this far.
+        guard AXIsProcessTrusted() else {
+            throw HotkeyError.accessibilityNotGranted
         }
 
         let mask: CGEventMask =
