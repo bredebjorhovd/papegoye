@@ -21,7 +21,8 @@ struct Setup: ParsableCommand {
         case .hostApplication(let name, _):
             print("Both attach to \(name) — the app that launched parrot — not to parrot itself.")
         case .ownBinary(let path):
-            print("No GUI app owns this session, so both attach to parrot itself: \(path)")
+            print("No GUI app owns this session, so both attach to \(subject.displayName) itself:")
+            print("  \(subject.grantPath ?? path)")
         }
         print()
 

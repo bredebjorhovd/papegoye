@@ -26,8 +26,23 @@ enum AccessibilitySubject: Codable, Equatable {
     /// How to name the subject in a sentence.
     var displayName: String {
         switch self {
-        case .hostApplication(let name, _): return name
-        case .ownBinary: return "parrot"
+        case .hostApplication(let name, _):
+            return name
+        case .ownBinary(let path):
+            // Installed as an app bundle, the row in the Accessibility list is
+            // the app — under its own name, with its own icon — not "parrot".
+            return AppBundle.enclosing(executable: path) == nil ? "parrot" : AppBundle.displayName
+        }
+    }
+
+    /// What the user drags into the Accessibility list with +: the `.app` when
+    /// parrot is installed as one, otherwise the binary itself.
+    var grantPath: String? {
+        switch self {
+        case .hostApplication(_, let bundlePath):
+            return bundlePath
+        case .ownBinary(let path):
+            return AppBundle.enclosing(executable: path) ?? path
         }
     }
 }
@@ -93,7 +108,26 @@ enum SessionKind: Equatable {
         if let service = environment["XPC_SERVICE_NAME"], service.contains(Install.label) {
             return true
         }
+        if isApplicationLaunch(environment: environment) { return false }
         return parentPID == 1 && !hasTerminal
+    }
+
+    /// Whether LaunchServices started this process — i.e. someone opened
+    /// `Papegøye.app` (gh#37).
+    ///
+    /// From the inside that looks exactly like a LaunchAgent: parent pid 1, no
+    /// terminal, and `XPC_SERVICE_NAME=0`. The difference is that LaunchServices
+    /// stamps the bundle identifier of the app it is launching into the
+    /// environment, and launchd exec'ing the same binary out of the bundle does
+    /// not. It matters because there *is* a user in front of a double-clicked
+    /// app, and they should get the permission dialog the daemon must never
+    /// open.
+    ///
+    /// The launchd marker is checked before this, so an agent installed by
+    /// `parrot install` stays recognised as an agent no matter what else is in
+    /// its environment — the gh#35 prompt storm can't come back through here.
+    static func isApplicationLaunch(environment: [String: String]) -> Bool {
+        environment["__CFBundleIdentifier"] == AppBundle.identifier
     }
 
     static func detect() -> SessionKind {
@@ -101,11 +135,17 @@ enum SessionKind: Equatable {
     }
 }
 
-/// Path plus a cheap content fingerprint for the running binary.
+/// Path plus whatever identifies the binary to TCC.
 ///
 /// Unsigned binaries are identified by path *and* contents, so a release
 /// upgrade that overwrites the file silently invalidates an existing grant.
 /// Size and modification date are enough to notice that happened.
+///
+/// A properly signed binary is identified by its signature instead, and that
+/// is the whole point of shipping a signed `Papegøye.app` (gh#37): a rebuild
+/// changes every byte and none of the identity, so parrot must not report a
+/// grant as lost — or spend a fresh prompt — over a file that macOS considers
+/// the same program.
 struct BinaryIdentity: Codable, Equatable {
     let path: String
     let fingerprint: String
@@ -113,6 +153,9 @@ struct BinaryIdentity: Codable, Equatable {
     static func of(path: String, fileManager: FileManager = .default) -> BinaryIdentity? {
         guard let attributes = try? fileManager.attributesOfItem(atPath: path) else {
             return nil
+        }
+        if let stable = CodeSignature.of(path: path)?.stableFingerprint {
+            return BinaryIdentity(path: path, fingerprint: stable)
         }
         let size = (attributes[.size] as? NSNumber)?.int64Value ?? -1
         let modified = (attributes[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
@@ -461,13 +504,15 @@ enum AccessibilityGuidance {
                 lines.append("  1. Toggle \(name) on in the Accessibility list.")
             }
         case .ownBinary(let path):
-            lines.append("  No GUI app owns this session, so parrot itself is the entry that needs")
-            lines.append("  Accessibility access:")
-            lines.append("    \(path)")
+            // Bundled, the entry is Papegøye.app; unbundled, it is the binary.
+            let target = subject.grantPath ?? path
+            lines.append("  No GUI app owns this session, so \(subject.displayName) itself is the entry")
+            lines.append("  that needs Accessibility access:")
+            lines.append("    \(target)")
             if case .revokedAfterUpgrade = diagnosis {
-                lines.append("  1. Remove the old parrot entry with −, then add \(path) with +.")
+                lines.append("  1. Remove the old parrot entry with −, then add \(target) with +.")
             } else {
-                lines.append("  1. Add \(path) to the Accessibility list with +.")
+                lines.append("  1. Add \(target) to the Accessibility list with +.")
             }
             lines.append("     (inside tmux or screen, grant that binary instead — it owns the session)")
         }
@@ -514,7 +559,7 @@ enum AccessibilityGuidance {
         case .hostApplication(let name, _):
             return "enable \(name) (your terminal, not parrot)"
         case .ownBinary(let path):
-            return "add \(path)"
+            return "add \(subject.grantPath ?? path)"
         }
     }
 }

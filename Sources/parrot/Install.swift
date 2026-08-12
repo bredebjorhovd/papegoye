@@ -291,26 +291,75 @@ struct Install: ParsableCommand {
         }
     }
 
-    private func resolveBinaryPath() throws -> String {
-        // /usr/local/bin/parrot is the canonical install path, but ~/.local/bin
-        // (or anything on PATH) is equally valid — the agent must point at the
-        // binary the user actually runs, wherever that is.
-        let candidate = "/usr/local/bin/parrot"
-        if FileManager.default.isExecutableFile(atPath: candidate) {
-            return candidate
-        }
-        // Resolve the running executable, following PATH and symlinks. argv0 is
-        // just "parrot" when invoked via PATH, so look it up directly.
-        if let running = ExecutablePath.current(), FileManager.default.isExecutableFile(atPath: running) {
-            FileHandle.standardError.write(Data(
-                "note: /usr/local/bin/parrot not found; using \(running)\n".utf8
-            ))
+    /// The usual homes for the `parrot` command, in the order to trust them.
+    /// Either can be a real binary or a symlink into `Papegøye.app`.
+    static func cliCandidates(
+        home: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [String] {
+        [
+            "/usr/local/bin/parrot",
+            home.appendingPathComponent(".local/bin/parrot").path,
+        ]
+    }
+
+    /// Which binary the LaunchAgent should exec.
+    ///
+    /// TCC grants attach to a code signature, so when parrot is installed as
+    /// `Papegøye.app` the agent has to point *into the bundle* — that is the
+    /// program the Accessibility grant is for, and pointing anywhere else
+    /// installs a daemon that will never be trusted (gh#37). A symlink on PATH
+    /// execs the same file, but the plist is read by humans at least as often
+    /// as by launchd, so it says what it means.
+    ///
+    /// Failing that, the old rule stands: prefer a `parrot` on PATH over
+    /// whatever ran `install`, since that is the one the user actually invokes.
+    static func daemonBinary(
+        running: String?,
+        candidates: [String],
+        resolve: (String) -> String?
+    ) -> String? {
+        if let running, AppBundle.enclosing(executable: running) != nil {
             return running
         }
-        FileHandle.standardError.write(Data(
-            "couldn't locate the parrot binary. install it to /usr/local/bin/parrot first.\n".utf8
-        ))
-        throw ExitCode(1)
+        for candidate in candidates {
+            if let resolved = resolve(candidate), AppBundle.enclosing(executable: resolved) != nil {
+                return resolved
+            }
+        }
+        for candidate in candidates where resolve(candidate) != nil {
+            return candidate
+        }
+        return running
+    }
+
+    /// Symlink-resolved path of an executable, or nil if there isn't one there.
+    static func resolveExecutable(_ path: String) -> String? {
+        guard FileManager.default.isExecutableFile(atPath: path) else { return nil }
+        guard let real = realpath(path, nil) else { return path }
+        defer { free(real) }
+        return String(cString: real)
+    }
+
+    private func resolveBinaryPath() throws -> String {
+        // `ExecutablePath.current()` already follows PATH and symlinks; argv0 is
+        // just "parrot" when invoked via PATH, so it can't be used directly.
+        let resolved = Self.daemonBinary(
+            running: ExecutablePath.current(),
+            candidates: Self.cliCandidates(),
+            resolve: Self.resolveExecutable
+        )
+        guard let resolved, FileManager.default.isExecutableFile(atPath: resolved) else {
+            FileHandle.standardError.write(Data(
+                "couldn't locate the parrot binary. install it to /usr/local/bin/parrot first.\n".utf8
+            ))
+            throw ExitCode(1)
+        }
+        if let app = AppBundle.enclosing(executable: resolved) {
+            FileHandle.standardError.write(Data(
+                "note: pointing the agent inside \(app) — that bundle is what TCC grants.\n".utf8
+            ))
+        }
+        return resolved
     }
 
     private func uid() -> uid_t { getuid() }

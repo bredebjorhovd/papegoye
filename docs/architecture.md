@@ -25,7 +25,9 @@
 - **Permissions plumbing** (microphone, accessibility) is dramatically smoother in a Swift binary than via Rust crates.
 - **AppKit overlay for free.** The recording indicator (see below) is a borderless `NSWindow` — trivial in Swift, awkward in Rust.
 
-The binary is a Swift Package executable — `swift build`, `swift run`, ship a single binary. Even with the overlay window, there is no `.app` bundle, no menubar entry, no dock icon.
+The binary is a Swift Package executable — `swift build`, `swift run`, ship a single binary. Even with the overlay window, there is no dock icon, and releases are a bare executable rather than an app.
+
+`make install` wraps that same executable in a signed `Papegøye.app` for local use, because a permission grant follows a code signature and a single binary has none (gh#37, see [Signing and TCC identity](#signing-and-tcc-identity)). Nothing in the program depends on being bundled: the command is a symlink into it.
 
 ## High-level shape
 
@@ -207,6 +209,18 @@ This is a macOS platform behavior, not a parrot bug. `parrot doctor` walks up th
 
 `setup` deep-links to `x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility` and then polls `AXIsProcessTrusted()` for up to three minutes, so flipping the toggle finishes setup in place rather than requiring a re-run.
 
+### Signing and TCC identity
+
+TCC keys a grant to the code signature and re-evaluates the stored *designated requirement* against whatever runs from that path. An unsigned binary has no identity beyond its own bytes, so every rebuild is a new program: the grant is dropped and a second, indistinguishable row appears in the Accessibility list. That is the whole reason `Papegøye.app` exists (gh#37).
+
+- `scripts/build-app.sh` assembles the bundle around `.build/release/parrot` and signs it with whatever certificate the machine has — discovered through `security find-identity -v -p codesigning`, never hardcoded, because the hash differs per machine and certificates expire. An Apple Development certificate is enough; a Developer ID one is preferred when present, since that is what distribution (gh#36) would use.
+- The bundle identifier is `no.bredebjorhovd.papegoye`. Not `com.digimata.parrot`: that is upstream's, and it is already the LaunchAgent label.
+- The hardened runtime is on, with `com.apple.security.device.audio-input` — required for the mic once bundled, and required by notarization later. A bundled app also needs `NSMicrophoneUsageDescription`, which a bare binary never did.
+- `BinaryIdentity` records the signing identifier rather than path+size+mtime whenever the binary is properly signed, so a rebuilt signed binary is not mistaken for a replaced one — otherwise parrot would report a grant as lost, and spend a fresh prompt, over a file macOS considers the same program.
+- `install --launch-at-login` resolves the CLI symlink and points the plist *inside* the bundle. The agent must exec the program the grant is for.
+- Opening the app from Finder looks exactly like being started by launchd from the inside — parent pid 1, no terminal, `XPC_SERVICE_NAME=0` — so the launchd check also asks whether LaunchServices stamped `__CFBundleIdentifier` into the environment. The plist's own `PARROT_UNDER_LAUNCHD` marker is still checked first, so gh#35's prompt storm cannot come back through the bundle.
+- `make verify` rebuilds and asks `codesign` whether the fresh build satisfies the requirement recorded for the installed one — the same evaluation TCC makes, minus the click.
+
 ## Models — what ships
 
 Initial registry:
@@ -301,4 +315,4 @@ Swift's module unit is the **SPM target** (one target = one module = one `import
 - **Parakeet via FluidAudio vs. direct CoreML?** FluidAudio is faster to integrate but adds a dependency. Decide once we benchmark both.
 - **Hotkey conflicts.** Right-Option is unused on most keyboards but some users remap it. Print a clear error if `CGEventTap` registration fails.
 - **First-run UX.** Bundle `whisper-base.en` so `parrot` works out of the box, or always require an explicit download? Probably the latter — keeps the binary small and the model directory clean.
-- **Code signing.** A self-built unsigned binary works fine locally but accessibility permission persistence is more reliable for signed binaries. Decide if we sign for personal distribution.
+- **Code signing.** Settled for local builds (gh#37): `make install` signs `Papegøye.app` with the machine's own Apple Development certificate, which is what makes the Accessibility grant survive a rebuild. Signing *releases* — a Developer ID certificate and notarization, so the download works on someone else's Mac — is still open (gh#36).
