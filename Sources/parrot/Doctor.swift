@@ -34,6 +34,7 @@ enum DoctorReport {
             checkMicrophone(),
             checkInputDevice(AudioDevices.resolve(preference: inputPreference)),
             checkAccessibility(),
+            checkCodeSignature(),
             checkFnKeyMapping(),
             checkModelCacheLocation(),
         ]
@@ -73,6 +74,72 @@ enum DoctorReport {
             remediation: "parrot models migrate — moves it to \(ModelCache.applicationSupportBase.appendingPathComponent("models").path)"
         )
     }
+
+    /// How the running binary is signed, which is what TCC keys its grants to.
+    ///
+    /// Nothing is broken when it is unsigned — that is how the released tarball
+    /// ships — but it is the whole difference between a permission you grant
+    /// once and one you re-grant after every upgrade, and it is otherwise
+    /// invisible until the grant goes missing (gh#37). Only an expired
+    /// certificate is a warning: the next build after that signs under an
+    /// identity macOS has never seen.
+    static func checkCodeSignature(
+        _ signature: CodeSignature? = CodeSignature.current(),
+        now: Date = Date()
+    ) -> Check {
+        let name = "code signature"
+        let buildSigned =
+            "`make install` builds a signed Papegøye.app, whose grant survives a rebuild"
+
+        guard let signature else {
+            return Check(
+                name: name,
+                status: .ok,
+                remediation: buildSigned,
+                detail: "unsigned — macOS drops the Accessibility grant whenever the binary changes"
+            )
+        }
+        guard !signature.isAdHoc else {
+            return Check(
+                name: name,
+                status: .ok,
+                remediation: buildSigned,
+                detail: "ad-hoc signed — the identity changes on every rebuild"
+            )
+        }
+
+        var detail = signature.identifier
+        if let authority = signature.authority {
+            detail += " · \(authority)"
+        }
+        guard let expiry = signature.expiry else {
+            return Check(name: name, status: .ok, remediation: nil, detail: detail)
+        }
+        if expiry < now {
+            return Check(
+                name: name,
+                status: .warn("\(detail) — the certificate expired \(day(expiry))"),
+                remediation: "renew it (Xcode → Settings → Accounts → Manage Certificates), "
+                    + "rebuild, then re-grant Accessibility once"
+            )
+        }
+        return Check(
+            name: name,
+            status: .ok,
+            remediation: nil,
+            detail: "\(detail) · expires \(day(expiry))"
+        )
+    }
+
+    private static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    static func day(_ date: Date) -> String { dayFormatter.string(from: date) }
 
     /// nil when there is no LaunchAgent installed — most people run parrot from
     /// a terminal, and a row about something they never installed is noise.

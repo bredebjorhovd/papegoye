@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The hardened runtime denies mic access unless the entitlement is there,
+         no matter what TCC says. Everything else parrot does — the event tap,
+         CoreML on the ANE, writing the model cache — needs no entitlement.
+         Notarization (#36) will want the hardened runtime anyway. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>

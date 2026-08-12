@@ -63,7 +63,8 @@ or approve it once under System Settings → Privacy & Security → *Open Anyway
 Because the binary is unsigned, macOS identifies it by path and contents — so
 **replacing it on upgrade usually means re-granting Accessibility** under
 System Settings → Privacy & Security → Accessibility. `parrot doctor` recognises
-that case and says so, instead of reporting a plain "not granted".
+that case and says so, instead of reporting a plain "not granted". A local build
+can avoid it entirely: see [Build a signed `Papegøye.app`](#build-a-signed-papegøyeapp-37).
 
 ### If the accessibility prompt never appears
 
@@ -74,6 +75,10 @@ app to toggle. That app is your *terminal* (Terminal, iTerm, Ghostty…), not
 parrot: the grant follows whatever launched parrot. Setup keeps watching while
 you flip the switch and continues on its own, so there is nothing to re-run.
 
+The exception is when nothing GUI launched parrot — the LaunchAgent, or opening
+`Papegøye.app` yourself. Then parrot *is* the subject, and the entry to enable
+is **Papegøye** (or the bare binary, if you run an unsigned build).
+
 ### Build from source instead
 
 ```sh
@@ -82,7 +87,72 @@ cd papegoye && swift build -c release
 cp .build/release/parrot ~/.local/bin/parrot
 ```
 
-Building locally sidesteps quarantine entirely.
+Building locally sidesteps quarantine entirely — but see the next section for
+the version that also keeps its permissions.
+
+### Build a signed `Papegøye.app` (#37)
+
+A grant in Privacy & Security is keyed to a code signature, and an unsigned
+binary's signature is its own contents: every rebuild is a different program, so
+Accessibility is dropped and a fresh, indistinguishable row appears in the list.
+Signing with a certificate that outlives the build fixes that, and it does not
+need a paid developer account.
+
+```sh
+make install                                   # build, sign, install the .app
+parrot install --launch-at-login --bilingual   # re-point the agent at the bundle
+```
+
+`make install` puts `Papegøye.app` in `~/Applications` and links
+`~/.local/bin/parrot` at the binary inside it, so the CLI is unchanged — macOS
+resolves the symlink before it looks at the signature, which means the command,
+the daemon and the Accessibility row are all one identity. Override the
+locations with `APP_DIR=` / `BIN_DIR=`.
+
+The certificate is discovered, never hardcoded — `security find-identity -v -p
+codesigning`, since the hash differs per machine and certificates expire. A free
+Apple ID gives you an *Apple Development* certificate (Xcode → Settings →
+Accounts → Manage Certificates → +), which is all this needs; pick a specific
+one with `CODESIGN_IDENTITY=...`.
+
+**What it buys.** Rebuild, `make install` again, and the Accessibility grant is
+still there with no second row — the whole point. `make verify` proves the
+mechanism without a click: it rebuilds and asks `codesign` whether the new build
+still satisfies the requirement recorded for the installed one, which is the
+test TCC itself makes.
+
+To see the other half for yourself:
+
+```sh
+make install
+open ~/Applications/Papegøye.app     # adds a Papegøye row to Accessibility
+                                     # → turn it on in System Settings
+launchctl kickstart -k gui/$(id -u)/com.digimata.parrot
+parrot doctor                        # launch agent: running (pid …)
+
+# now rebuild and do it again
+make install
+launchctl kickstart -k gui/$(id -u)/com.digimata.parrot
+parrot doctor                        # still running, and still one row
+```
+
+**What it does not buy.** Anything for anyone else: an Apple Development
+certificate is not trusted on another Mac and the app is not notarized, so
+distributing to other people is still #36. It also does not skip the *first*
+grant — moving from an unsigned binary to the app changes the identity once, so
+Accessibility has to be granted one last time. It appears as **Papegøye**, under
+its own name and icon, rather than as a path.
+
+**When the certificate expires** — Apple Development certificates last a year,
+and `parrot doctor` prints the date — the next build signs under an identity
+macOS has not seen, which costs exactly one re-grant. Renew it in Xcode →
+Settings → Accounts → Manage Certificates, rebuild, toggle it once.
+
+```sh
+make app        # build and sign into build/Papegøye.app, install nothing
+make identity   # what TCC sees: identifier, team, requirement, expiry
+make uninstall  # remove the app and the symlink
+```
 
 ### Launch at login
 
@@ -96,6 +166,11 @@ parrot install --launch-at-login --bilingual
 parrot install --launch-at-login --bilingual --en-model whisper-small.en
 parrot install --uninstall             # boots the agent out and deletes the plist
 ```
+
+When parrot is installed as `Papegøye.app`, the plist names the binary *inside*
+the bundle rather than the symlink on your `PATH` — that is the program the
+Accessibility grant belongs to, and pointing anywhere else installs a daemon
+macOS will never trust.
 
 Model ids are checked when you install, not at next login — a bad `--no-model`
 fails in your terminal instead of silently in `/tmp/parrot.err.log`.
