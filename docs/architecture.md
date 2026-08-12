@@ -71,6 +71,7 @@ Subcommands:
 - `parrot` (default) — run the daemon
 - `parrot models list` — show registered models, mark which are downloaded
 - `parrot models download <id>` — pre-fetch a model
+- `parrot models migrate` — move a legacy `~/Documents/huggingface` cache to the Application Support base (#34)
 - `parrot doctor` — check microphone and accessibility permissions, print remediation steps
 
 ### `HotkeyMonitor`
@@ -217,6 +218,8 @@ Initial registry:
 | Parakeet | `parakeet-tdt-0.6b-v3` | ~600 MB | English, fastest on ANE |
 
 Models live in `~/Library/Application Support/parrot/models/`. Not bundled — fetched on first selection or via `parrot models download`.
+
+WhisperKit's Hub layer would otherwise put them in `~/Documents/huggingface`, which iCloud syncs and evicts (#34), so `ModelCache` is the single place that decides the download base and every call site — load, download, doctor — goes through it. An install that already has a cache under `~/Documents` keeps using it until `parrot models migrate` moves it; warm-up never moves files on its own.
 
 ## Data flow, end-to-end
 

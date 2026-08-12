@@ -1,8 +1,8 @@
 import Foundation
 import WhisperKit
 
-/// Downloads a model into the Hub cache (~/Documents/huggingface/models/<repo>/)
-/// with visible progress, before WhisperKit loads it.
+/// Downloads a model into the Hub cache (see `ModelCache`) with visible
+/// progress, before WhisperKit loads it.
 ///
 /// WhisperKit's own download path (WhisperKit(config)) silently fetches
 /// gigabytes with verbose off, which reads as a hang on first run. So we
@@ -10,20 +10,17 @@ import WhisperKit
 /// download. Model-folder overrides (PARROT_NB_MODEL_FOLDER) never download.
 enum ModelFetch {
     /// True when the model has no explicit local folder and nothing matching it
-    /// is cached on disk yet. Mirrors Doctor.checkModelDownloaded's layout
-    /// assumption: a non-empty variant folder directly under the repo dir.
+    /// is cached on disk yet — in either cache base, so an existing Documents
+    /// cache is not re-downloaded (gh#34).
     static func needsDownload(_ model: TranscriptionModel) -> Bool {
         guard let variant = model.whisperKitID, model.modelFolder == nil else {
             return false
         }
-        let repo = model.modelRepo ?? "argmaxinc/whisperkit-coreml"
-        let repoDir = FileManager.default
-            .urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("huggingface/models/\(repo)")
-        let candidates = (try? FileManager.default.contentsOfDirectory(atPath: repoDir.path)) ?? []
-        return !candidates.contains {
-            $0.contains(variant) && directoryNonEmpty(repoDir.appendingPathComponent($0).path)
-        }
+        return ModelCache.cachedVariantDirectory(
+            base: ModelCache.base(for: model),
+            repo: model.repoID,
+            variant: variant
+        ) == nil
     }
 
     /// Downloads and reports `\r`-overwritten percent lines on stderr. On
@@ -33,23 +30,15 @@ enum ModelFetch {
         guard let variant = model.whisperKitID else {
             throw TranscriberError.missingEngineID
         }
-        let repo = model.modelRepo ?? "argmaxinc/whisperkit-coreml"
         FileHandle.standardError.write(Data("↓ downloading \(model.id) (\(model.sizeMB) MB)…\n".utf8))
         let renderer = ProgressRenderer(label: model.id)
         _ = try await WhisperKit.download(
             variant: variant,
-            from: repo,
+            downloadBase: ModelCache.base(for: model),
+            from: model.repoID,
             progressCallback: { renderer.update($0) }
         )
         FileHandle.standardError.write(Data(("\r" + String(repeating: " ", count: 64) + "\r").utf8))
-    }
-
-    private static func directoryNonEmpty(_ path: String) -> Bool {
-        var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else {
-            return false
-        }
-        return !((try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []).isEmpty
     }
 
     /// Throttled `\r` progress bar. WhisperKit drives it from a background

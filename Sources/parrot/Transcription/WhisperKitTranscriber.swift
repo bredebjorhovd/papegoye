@@ -23,21 +23,14 @@ actor WhisperKitTranscriber: Transcriber {
     /// download/load.
     func warmUp() async throws {
         if pipeline != nil { return }
-        guard let whisperKitID = model.whisperKitID else {
+        guard model.whisperKitID != nil else {
             throw TranscriberError.missingEngineID
         }
         if ModelFetch.needsDownload(model) {
             try await ModelFetch.download(model)
         }
         FileHandle.standardError.write(Data("loading \(model.id)...\n".utf8))
-        let config = WhisperKitConfig(
-            model: whisperKitID,
-            modelRepo: model.modelRepo,
-            modelFolder: model.modelFolder,
-            verbose: false,
-            prewarm: true,
-            load: true
-        )
+        let config = ModelCache.configuration(for: model)
         let started = recorder?.now()
         pipeline = try await WhisperKit(config)
         if let recorder, let started {

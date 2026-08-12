@@ -10,21 +10,14 @@ import WhisperKit
 enum LIDPipeline {
     static func load(_ model: TranscriptionModel, recorder: WarmUpRecorder? = nil) async throws -> WhisperKit {
         do {
-            guard let whisperKitID = model.whisperKitID else {
+            guard model.whisperKitID != nil else {
                 throw TranscriberError.missingEngineID
             }
             FileHandle.standardError.write(Data("loading \(model.id) (lid)...\n".utf8))
             if ModelFetch.needsDownload(model) {
                 try await ModelFetch.download(model)
             }
-            let config = WhisperKitConfig(
-                model: whisperKitID,
-                modelRepo: model.modelRepo,
-                modelFolder: model.modelFolder,
-                verbose: false,
-                prewarm: true,
-                load: true
-            )
+            let config = ModelCache.configuration(for: model)
             let started = recorder?.now()
             let pipeline = try await WhisperKit(config)
             if let recorder, let started {

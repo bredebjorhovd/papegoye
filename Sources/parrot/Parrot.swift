@@ -352,7 +352,7 @@ struct Doctor: ParsableCommand {
 struct Models: ParsableCommand {
     static let configuration = CommandConfiguration(
         abstract: "Manage transcription models.",
-        subcommands: [List.self, Download.self]
+        subcommands: [List.self, Download.self, Migrate.self]
     )
 
     struct List: ParsableCommand {
@@ -405,6 +405,58 @@ struct Models: ParsableCommand {
             }
             sem.wait()
             if let e = capturedError { throw e }
+        }
+    }
+
+    struct Migrate: ParsableCommand {
+        static let configuration = CommandConfiguration(
+            abstract: "Move the model cache out of iCloud-synced ~/Documents.",
+            discussion: """
+                Older versions downloaded models to ~/Documents/huggingface, \
+                WhisperKit's default. With iCloud "Desktop & Documents Folders" \
+                sync on, that uploads ~1 GB to iCloud and lets iCloud evict the \
+                weights — which breaks bilingual warm-up with "Resource deadlock \
+                avoided". This copies the cache to ~/Library/Application Support/\
+                parrot/models, verifies every file, and only then removes the old \
+                copy. Nothing is downloaded again.
+                """
+        )
+
+        @Flag(name: .long, help: "Report what would move, then stop.")
+        var dryRun: Bool = false
+
+        @Flag(name: .long, help: "Leave the old copy in ~/Documents after a verified copy.")
+        var keepOld: Bool = false
+
+        func run() throws {
+            let plan = CacheMigration.plan()
+            guard !plan.isEmpty else {
+                print("nothing to migrate — no cache at \(plan.source.path)")
+                print("models are cached at \(plan.destination.appendingPathComponent("models").path)")
+                return
+            }
+            print("from: \(plan.source.path)")
+            print("  to: \(plan.destination.path)")
+            print("      \(plan.items.count) files · \(CacheMigration.formatBytes(plan.totalBytes))")
+            if plan.evictedCount > 0 {
+                print("      \(plan.evictedCount) evicted by iCloud — those are downloaded first, which is the slow part")
+            }
+            if dryRun {
+                print("(dry run — nothing moved)")
+                return
+            }
+            do {
+                try CacheMigration.run(plan, keepOld: keepOld)
+            } catch let failure as CacheMigration.Failure {
+                print("\(failure.description)")
+                throw ExitCode(1)
+            }
+            print("✓ migrated to \(plan.destination.appendingPathComponent("models").path)")
+            if keepOld {
+                print("  old copy left at \(plan.source.path) — it is still synced to iCloud until you remove it")
+            } else {
+                print("  removed \(plan.source.path)")
+            }
         }
     }
 }
