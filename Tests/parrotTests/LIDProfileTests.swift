@@ -306,4 +306,253 @@ final class LIDProfileTests: XCTestCase {
         XCTAssertTrue(scaling["isFixedCost"] is NSNull)
         XCTAssertEqual((root["cells"] as? [[String: Any]])?.count, 1)
     }
+
+    // MARK: - Arms (gh#25)
+
+    private func arm(_ arm: LIDArm, median: Double) -> LIDMeasurement {
+        // One in-scope cell whose median is the number under test.
+        LIDMeasurement(
+            modelID: "whisper-tiny",
+            sampleRate: 16_000,
+            windowSamples: 480_000,
+            coldMillis: nil,
+            cells: [cell(5, [median])],
+            arm: arm,
+            residentModelIDs: arm.needsFullModelSet
+                ? ["whisper-tiny", "nb-whisper-small", "whisper-small.en"]
+                : ["whisper-tiny"]
+        )
+    }
+
+    func testArmsAlwaysRunLidOnlyFirstWhateverOrderTheyWereAskedFor() throws {
+        // A loaded CoreML pipeline cannot be unloaded, so the lid-only arm is
+        // only honest before the other two models exist. Order is the harness's
+        // to decide, not the caller's.
+        XCTAssertEqual(try LIDSweepInput.arms("daemon,lid-only"), [.lidOnly, .daemon])
+        XCTAssertEqual(try LIDSweepInput.arms("all"), [.lidOnly, .threeResident, .daemon])
+        XCTAssertEqual(try LIDSweepInput.arms("daemon, daemon"), [.daemon])
+        XCTAssertThrowsError(try LIDSweepInput.arms("resident"))
+        XCTAssertThrowsError(try LIDSweepInput.arms(""))
+    }
+
+    func testUnknownArmNamesTheOnesThatExist() {
+        let error = LIDSweepInput.ParseError.unknownArm("bilingual")
+        XCTAssertTrue(error.description.contains("three-resident"), error.description)
+        XCTAssertTrue(error.description.contains("all"), error.description)
+    }
+
+    func testEachAttributionTermIsTheOneChangeAboveIt() throws {
+        let c = LIDComparison(
+            arms: [arm(.lidOnly, median: 20), arm(.threeResident, median: 26),
+                   arm(.daemon, median: 30)],
+            observedDaemonMillis: 52
+        )
+        let a = try XCTUnwrap(c.attribution)
+        XCTAssertEqual(a.baseline, 20, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(a.residencyCost), 6, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(a.callPathCost), 4, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(a.unexplained), 22, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(a.gap), 32, accuracy: 0.001)
+        XCTAssertEqual(try XCTUnwrap(a.explained), 10, accuracy: 0.001)
+    }
+
+    func testTheGapIsMeasuredAgainstTheLiveDaemonWhenOneWasGiven() throws {
+        let arms = [arm(.lidOnly, median: 20), arm(.threeResident, median: 26),
+                    arm(.daemon, median: 30)]
+        // Without --observed there is nothing beyond the arms, so the gap stops
+        // at the daemon arm and the remainder is unmeasured rather than zero.
+        let bench = LIDComparison(arms: arms)
+        let benchOnly = try XCTUnwrap(bench.attribution)
+        XCTAssertEqual(try XCTUnwrap(benchOnly.gap), 10, accuracy: 0.001)
+        XCTAssertNil(benchOnly.unexplained)
+        XCTAssertNil(benchOnly.unexplainedShare)
+
+        let live = LIDComparison(arms: arms, observedDaemonMillis: 52)
+        XCTAssertEqual(try XCTUnwrap(live.attribution?.gap), 32, accuracy: 0.001)
+    }
+
+    func testResidencyWinsWhenTheResidentModelsCostMostOfTheGap() {
+        // Deliberately short of the live number: an arm that reached it would
+        // be a reproduction, and there would be no gap left to attribute.
+        let c = LIDComparison(
+            arms: [arm(.lidOnly, median: 15), arm(.threeResident, median: 34),
+                   arm(.daemon, median: 36)],
+            observedDaemonMillis: 52
+        )
+        XCTAssertEqual(c.attribution?.verdict, .residency)
+        let text = LIDReport.text(c)
+        XCTAssertTrue(text.contains("RESIDENT MODELS"), text)
+        // The finding generalizes — the report has to say so, because it bears
+        // on the memory item and on a third route.
+        XCTAssertTrue(text.contains("memory acceptance item"), text)
+    }
+
+    func testCallPathWinsWhenTheDaemonPathCostsMostOfTheGap() {
+        let c = LIDComparison(
+            arms: [arm(.lidOnly, median: 15), arm(.threeResident, median: 16),
+                   arm(.daemon, median: 36)],
+            observedDaemonMillis: 52
+        )
+        XCTAssertEqual(c.attribution?.verdict, .callPath)
+        XCTAssertTrue(LIDReport.text(c).contains("CALL PATH"))
+    }
+
+    func testANegativeTermIsSpreadNotASaving() throws {
+        // The first real gh#25 run came out like this: the lid-only arm ran
+        // first and slowest, so "residency" was negative. Loading a second
+        // model cannot make LID faster — a negative term means the run-to-run
+        // spread is wider than the effect, and it must not be dressed up as a
+        // share of anything.
+        let c = LIDComparison(
+            arms: [arm(.lidOnly, median: 27.6), arm(.threeResident, median: 18.6),
+                   arm(.daemon, median: 17.0)],
+            observedDaemonMillis: 52
+        )
+        let a = try XCTUnwrap(c.attribution)
+        XCTAssertEqual(try XCTUnwrap(a.residencyCost), -9.0, accuracy: 0.05)
+        XCTAssertNil(a.residencyShare)
+        XCTAssertNil(a.callPathShare)
+        // A negative term contributes nothing to what was explained rather
+        // than cancelling a real cost beside it.
+        XCTAssertNil(a.explained)
+        XCTAssertEqual(a.verdict, .unexplained)
+        let text = LIDReport.text(c)
+        XCTAssertTrue(text.contains("below run-to-run spread"), text)
+        XCTAssertFalse(text.contains("-37%"), text)
+    }
+
+    func testAnArmThatLandsOnTheLiveNumberIsCalledAReproduction() throws {
+        // The gh#25 answer: with --gap 10 the arms reach the daemon's ~52ms.
+        // Once they do, the leftover gap is a few ms and dividing noise by it
+        // would print enormous shares — so reproduction is checked first.
+        let c = LIDComparison(
+            arms: [arm(.lidOnly, median: 48.3), arm(.threeResident, median: 57.0),
+                   arm(.daemon, median: 43.5)],
+            observedDaemonMillis: 52
+        )
+        let a = try XCTUnwrap(c.attribution)
+        XCTAssertEqual(try XCTUnwrap(a.reproduction), 43.5 / 52, accuracy: 0.001)
+        XCTAssertTrue(a.reproducesDaemon)
+        XCTAssertEqual(a.verdict, .reproducesDaemon)
+        let text = LIDReport.text(c)
+        XCTAssertTrue(text.contains("REPRODUCES THE DAEMON"), text)
+        XCTAssertTrue(text.contains("84% of the live daemon"), text)
+        // No share table, because there is nothing left to share out.
+        XCTAssertFalse(text.contains("gap to attribute"), text)
+    }
+
+    func testAnArmNowhereNearTheLiveNumberIsNotAReproduction() {
+        // gh#20's situation: the bench times something three times faster than
+        // the thing it claims to model, and has to say so.
+        let c = LIDComparison(
+            arms: [arm(.lidOnly, median: 19.6), arm(.daemon, median: 17.0)],
+            observedDaemonMillis: 52
+        )
+        XCTAssertFalse(c.attribution?.reproducesDaemon ?? true)
+        XCTAssertTrue(LIDReport.text(c).contains("33% of the live daemon"))
+    }
+
+    func testReproductionNeedsALiveNumberToCompareAgainst() {
+        let c = LIDComparison(arms: [arm(.lidOnly, median: 20), arm(.daemon, median: 22)])
+        XCTAssertNil(c.attribution?.reproduction)
+        XCTAssertFalse(c.attribution?.reproducesDaemon ?? true)
+    }
+
+    func testTheBenchSaysSoWhenItExplainsNoneOfTheGap() throws {
+        // The outcome gh#25 has to be able to report: both hypotheses measured,
+        // both small, most of the live latency still unaccounted for. That is a
+        // finding, not a failure to produce one.
+        let c = LIDComparison(
+            arms: [arm(.lidOnly, median: 20), arm(.threeResident, median: 21),
+                   arm(.daemon, median: 22)],
+            observedDaemonMillis: 52
+        )
+        let a = try XCTUnwrap(c.attribution)
+        XCTAssertEqual(a.verdict, .unexplained)
+        XCTAssertEqual(try XCTUnwrap(a.unexplainedShare), 30.0 / 32.0, accuracy: 0.001)
+        let text = LIDReport.text(c)
+        XCTAssertTrue(text.contains("NEITHER"), text)
+        // And it must name what it still cannot reach rather than implying the
+        // remainder is a mystery with no known candidates.
+        XCTAssertTrue(text.contains("microphone"), text)
+        XCTAssertTrue(text.contains("powermetrics"), text)
+    }
+
+    func testASingleArmMakesNoAttributionClaim() {
+        let c = LIDComparison(arms: [arm(.lidOnly, median: 20)])
+        XCTAssertEqual(c.attribution?.verdict, .notAttributable)
+        // With one arm and nothing to compare it to, the old single-arm report
+        // is what gets printed — no attribution section at all.
+        XCTAssertFalse(LIDReport.text(c).contains("attribution"))
+    }
+
+    func testAttributionNeedsTheBaselineArm() {
+        // Every term is a difference from lid-only; without it there is nothing
+        // to subtract from and the report has to say that rather than guess.
+        let c = LIDComparison(
+            arms: [arm(.threeResident, median: 26), arm(.daemon, median: 30)],
+            observedDaemonMillis: 52
+        )
+        XCTAssertNil(c.attribution)
+        let text = LIDReport.text(c)
+        XCTAssertTrue(text.contains("not computable"), text)
+        XCTAssertTrue(text.contains("--arms all"), text)
+    }
+
+    func testTheJudgedArmIsTheMostDaemonLikeOneThatRan() {
+        XCTAssertEqual(
+            LIDComparison(arms: [arm(.lidOnly, median: 20), arm(.daemon, median: 50)]).judgedArm?.arm,
+            .daemon
+        )
+        XCTAssertEqual(LIDComparison(arms: [arm(.lidOnly, median: 20)]).judgedArm?.arm, .lidOnly)
+        XCTAssertNil(LIDComparison(arms: []).judgedArm)
+    }
+
+    func testABackToBackSweepIsFlaggedAsUnlikeTheDaemon() {
+        // Every call in a tight loop keeps the ANE clocked up; the daemon's are
+        // seconds apart. A run that did not use --gap has to admit it.
+        let hammered = LIDComparison(
+            arms: [arm(.lidOnly, median: 20), arm(.daemon, median: 22)],
+            observedDaemonMillis: 52
+        )
+        XCTAssertTrue(LIDReport.text(hammered).contains("--gap"))
+
+        var spaced = arm(.lidOnly, median: 20)
+        spaced.gapSeconds = 5
+        var spacedDaemon = arm(.daemon, median: 22)
+        spacedDaemon.gapSeconds = 5
+        let report = LIDReport.text(
+            LIDComparison(arms: [spaced, spacedDaemon], observedDaemonMillis: 52)
+        )
+        XCTAssertFalse(report.contains("Re-run with"), report)
+        XCTAssertTrue(report.contains("5.0s idle before each timed call"), report)
+    }
+
+    func testJSONCarriesEveryArmAndTheAttribution() throws {
+        let c = LIDComparison(
+            arms: [arm(.lidOnly, median: 15), arm(.threeResident, median: 34),
+                   arm(.daemon, median: 36)],
+            observedDaemonMillis: 52
+        )
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(LIDReport.json(c).utf8)) as? [String: Any]
+        )
+        let arms = try XCTUnwrap(root["arms"] as? [[String: Any]])
+        XCTAssertEqual(arms.map { $0["arm"] as? String }, ["lid-only", "three-resident", "daemon"])
+        XCTAssertEqual((arms[1]["residentModels"] as? [String])?.count, 3)
+        let attribution = try XCTUnwrap(root["attribution"] as? [String: Any])
+        XCTAssertEqual(attribution["residencyMillis"] as? Double, 19)
+        XCTAssertEqual(attribution["unexplainedMillis"] as? Double, 16)
+        XCTAssertEqual(attribution["verdict"] as? String, "residency")
+    }
+
+    func testJSONNullsAnObservedNumberNobodyGave() throws {
+        let c = LIDComparison(arms: [arm(.lidOnly, median: 20), arm(.daemon, median: 22)])
+        let root = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(LIDReport.json(c).utf8)) as? [String: Any]
+        )
+        XCTAssertTrue(root["observedDaemonMillis"] is NSNull)
+        let attribution = try XCTUnwrap(root["attribution"] as? [String: Any])
+        XCTAssertTrue(attribution["unexplainedMillis"] is NSNull)
+    }
 }

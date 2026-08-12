@@ -4,9 +4,148 @@ import Foundation
 /// verdict — fixed cost vs tracks-length, and pass/fail against the 30 ms
 /// budget — is testable without a model or hardware.
 enum LIDReport {
+    /// A whole run: one arm rendered as before, or several plus the gh#25
+    /// attribution that only exists when there is something to compare.
+    static func text(_ c: LIDComparison) -> String {
+        var out: [String] = []
+        for (index, arm) in c.arms.enumerated() {
+            if index > 0 { out.append("\n" + String(repeating: "─", count: 72)) }
+            out.append(text(arm))
+        }
+        if !c.isSingleArm || c.observedDaemonMillis != nil {
+            out.append("")
+            out.append(String(repeating: "─", count: 72))
+            out.append(contentsOf: attribution(c))
+        }
+        return out.joined(separator: "\n")
+    }
+
+    /// The gh#25 question: of the difference between a `lid-only` bench number
+    /// and a live daemon, how much is resident models, how much is the call
+    /// path, and how much is neither?
+    static func attribution(_ c: LIDComparison) -> [String] {
+        var lines = ["attribution (median over in-scope cells, ≤ \(Int(LIDBudget.maxUtteranceSeconds))s)"]
+        guard let a = c.attribution else {
+            lines.append("  not computable — the lid-only arm did not run, and every term is a")
+            lines.append("  difference from it. Re-run with --arms all.")
+            return lines
+        }
+
+        /// A term is only a cost when it is positive. A negative one means the
+        /// arm below came out faster, which cannot be a cost of anything — it
+        /// is the run-to-run spread showing through, and it is printed as that.
+        func term(_ label: String, _ value: Double?) -> String {
+            guard let value else { return "" }
+            guard LIDAttribution.isMeasurable(value) else {
+                return String(format: "   %+6.1fms  %@ — below run-to-run spread", value, label)
+            }
+            return String(format: "   %+6.1fms  %@", value, label)
+        }
+        lines.append(String(format: "  lid-only          %7.1fms   %@",
+                            a.baseline, LIDArm.lidOnly.summary))
+        if let three = a.threeResident {
+            lines.append(String(format: "  three-resident    %7.1fms%@", three,
+                                term("residency", a.residencyCost)))
+        }
+        if let daemon = a.daemon {
+            lines.append(String(format: "  daemon            %7.1fms%@", daemon,
+                                term("call path", a.callPathCost)))
+        }
+        if let observed = a.observed {
+            lines.append(String(format: "  live daemon       %7.1fms%@   (--observed)", observed,
+                                term("unexplained", a.unexplained)))
+        }
+        if let reproduction = a.reproduction {
+            lines.append("")
+            lines.append(String(
+                format: "  the daemon-like arm is %.0f%% of the live daemon's %.1fms",
+                reproduction * 100, a.observed ?? 0
+            ))
+        }
+        lines.append("")
+
+        if a.verdict == .reproducesDaemon {
+            lines.append("  → REPRODUCES THE DAEMON. The arms land on the live number, so there is")
+            lines.append("    no gap left to split. Whatever this run did differently from the one")
+            lines.append("    that did not reproduce it is the answer — compare their --gap.")
+            lines.append(contentsOf: caveats(c))
+            return lines
+        }
+
+        guard let gap = a.gap, gap > 0 else {
+            lines.append("  no gap to attribute — the arms did not come out slower than lid-only.")
+            return lines
+        }
+        lines.append(String(format: "  gap to attribute  %7.1fms", gap))
+        func share(_ label: String, _ value: Double?, _ fraction: Double?) {
+            guard let value, let fraction else { return }
+            lines.append(String(format: "    %@%6.1fms  %3.0f%%",
+                                label.padding(toLength: 14, withPad: " ", startingAt: 0),
+                                value, fraction * 100))
+        }
+        share("residency", a.residencyCost, a.residencyShare)
+        share("call path", a.callPathCost, a.callPathShare)
+        share("unexplained", a.unexplained, a.unexplainedShare)
+        lines.append("")
+
+        switch a.verdict {
+        case .reproducesDaemon:
+            break  // handled above, before the share arithmetic
+        case .residency:
+            lines.append("  → RESIDENT MODELS. Holding the Norwegian and English pipelines loaded")
+            lines.append("    costs the LID pass a material share of the gap. That is bigger than")
+            lines.append("    this ticket: it also bears on the memory acceptance item and on any")
+            lines.append("    third route, because the cost is paid per resident model.")
+        case .callPath:
+            lines.append("  → CALL PATH. The daemon's own work around detectLangauge — actor hop,")
+            lines.append("    window copy, softmax over langProbs — costs a material share of the")
+            lines.append("    gap. That is Swift in this repo, so it is fixable here.")
+        case .unexplained:
+            lines.append("  → NEITHER. Resident models and the call path were both measured and")
+            lines.append("    neither accounts for the gap. What is left is what this bench cannot")
+            lines.append("    reach; see below.")
+        case .notAttributable:
+            lines.append("  → NOT ATTRIBUTABLE from this run — too few arms, or no gap between them.")
+            lines.append("    Re-run with --arms all, and pass --observed with a live daemon median.")
+        }
+
+        lines.append(contentsOf: caveats(c))
+        return lines
+    }
+
+    /// What the run could not reach, printed whatever the verdict was — a
+    /// verdict that omits its own blind spots reads as more than it is.
+    private static func caveats(_ c: LIDComparison) -> [String] {
+        var lines = [""]
+        lines.append("  What this still cannot reach, whatever the verdict above says:")
+        lines.append("    · the daemon calls LID immediately after audio capture stops, so capture")
+        lines.append("      teardown may compete with it. Reproducing that needs a microphone.")
+        if c.arms.allSatisfy({ $0.gapSeconds == 0 }) {
+            lines.append("    · every call here was made back to back, which keeps the ANE clocked up")
+            lines.append("      and the weights hot. The daemon's calls are seconds apart. Re-run with")
+            lines.append("      e.g. --gap 10 to price that in.")
+        }
+        lines.append("    · whether any of this runs on the ANE at all. That needs")
+        lines.append("      `sudo powermetrics --samplers ane_power`.")
+        if c.arms.count > 1 {
+            lines.append("")
+            lines.append("  Arms ran in one process, in the order printed: a loaded CoreML pipeline")
+            lines.append("  cannot be unloaded, so lid-only has to go first. For per-process numbers")
+            lines.append("  free of that ordering, run each arm as its own invocation.")
+        }
+        return lines
+    }
+
     static func text(_ m: LIDMeasurement) -> String {
         var out: [String] = []
         out.append("lid latency · \(m.modelID) · \(Int(m.sampleRate)) Hz")
+        out.append("  arm         \(m.arm.rawValue) — \(m.arm.summary)")
+        if !m.residentModelIDs.isEmpty {
+            out.append("  resident    \(m.residentModelIDs.joined(separator: ", "))")
+        }
+        if m.gapSeconds > 0 {
+            out.append(String(format: "  gap         %.1fs idle before each timed call", m.gapSeconds))
+        }
         if let windowSamples = m.windowSamples, let windowSeconds = m.windowSeconds {
             out.append(String(
                 format: "  mel window  %d samples (%.1fs) — every detectLangauge call pads or trims to this",
@@ -170,7 +309,47 @@ enum LIDReport {
     private static func orNull(_ value: Int?) -> Any { value ?? NSNull() as Any }
     private static func orNull(_ value: String?) -> Any { value ?? NSNull() as Any }
 
+    static func json(_ c: LIDComparison) -> String {
+        var root: [String: Any] = [
+            "arms": c.arms.map(object(_:)),
+            "observedDaemonMillis": orNull(c.observedDaemonMillis),
+        ]
+        if let a = c.attribution {
+            root["attribution"] = [
+                "baselineMillis": a.baseline,
+                "threeResidentMillis": orNull(a.threeResident),
+                "daemonMillis": orNull(a.daemon),
+                "observedMillis": orNull(a.observed),
+                "residencyMillis": orNull(a.residencyCost),
+                "callPathMillis": orNull(a.callPathCost),
+                "unexplainedMillis": orNull(a.unexplained),
+                "gapMillis": orNull(a.gap),
+                "residencyShare": orNull(a.residencyShare),
+                "callPathShare": orNull(a.callPathShare),
+                "unexplainedShare": orNull(a.unexplainedShare),
+                "materialShare": LIDAttribution.materialShare,
+                "reproduction": orNull(a.reproduction),
+                "reproducesDaemon": a.reproducesDaemon,
+                "verdict": String(describing: a.verdict),
+            ] as [String: Any]
+        }
+        return encode(root)
+    }
+
     static func json(_ m: LIDMeasurement) -> String {
+        encode(object(m))
+    }
+
+    private static func encode(_ root: [String: Any]) -> String {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: root, options: [.prettyPrinted, .sortedKeys]
+        ) else {
+            return "{}"
+        }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func object(_ m: LIDMeasurement) -> [String: Any] {
         let s = m.scaling
         let cells: [[String: Any]] = m.cells.map { cell in
             [
@@ -186,7 +365,10 @@ enum LIDReport {
                 "detectedLanguage": orNull(cell.detectedLanguage),
             ]
         }
-        let root: [String: Any] = [
+        return [
+            "arm": m.arm.rawValue,
+            "residentModels": m.residentModelIDs,
+            "gapSeconds": m.gapSeconds,
             "model": m.modelID,
             "sampleRate": m.sampleRate,
             "windowSamples": orNull(m.windowSamples),
@@ -219,11 +401,5 @@ enum LIDReport {
                 "fixedCostThreshold": LIDScaling.fixedCostThreshold,
             ] as [String: Any],
         ]
-        guard let data = try? JSONSerialization.data(
-            withJSONObject: root, options: [.prettyPrinted, .sortedKeys]
-        ) else {
-            return "{}"
-        }
-        return String(decoding: data, as: UTF8.self)
     }
 }

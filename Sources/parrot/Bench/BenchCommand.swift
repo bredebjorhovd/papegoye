@@ -205,6 +205,12 @@ struct Bench: ParsableCommand {
     /// the audio says, so the sweep runs on generated signals: no microphone,
     /// no fixtures, no Norwegian speaker. That also bounds what it can answer
     /// — it measures latency, never accuracy.
+    ///
+    /// gh#25: a `lid-only` pass at 19.6 ms did not predict the live daemon's
+    /// ~52 ms on the same release build. `--arms` runs the sweep again with the
+    /// daemon's full three-model set resident, and again through the daemon's
+    /// own call path, so the difference between those situations is measured
+    /// rather than guessed at.
     struct LID: ParsableCommand {
         static let configuration = CommandConfiguration(
             commandName: "lid",
@@ -220,13 +226,28 @@ struct Bench: ParsableCommand {
         @Option(name: .long, help: "Timed calls per cell. One cold call is timed separately, before the sweep.")
         var iterations: Int = 5
 
+        @Option(name: .long, help: "What to hold resident and which call path to time: lid-only, three-resident, daemon, or all.")
+        var arms: String = LIDArm.lidOnly.rawValue
+
+        @Option(name: .long, help: "Idle seconds before each timed call. The daemon's calls are seconds apart; a back-to-back loop is not.")
+        var gap: Double = 0
+
+        @Option(name: .long, help: "Median ◐ lid latency from a live daemon session, in ms — the bench cannot measure it itself.")
+        var observed: Double?
+
         @Option(name: .customLong("lid-model"), help: "Model used for the LID pass.")
         var lidModel: String = BilingualConfiguration.lidModelID
+
+        @Option(name: .customLong("no-model"), help: "Norwegian model held resident by the three-model arms.")
+        var noModel: String = BilingualConfiguration.defaultNorwegianModelID
+
+        @Option(name: .customLong("en-model"), help: "English model held resident by the three-model arms.")
+        var enModel: String = BilingualConfiguration.defaultEnglishModelID
 
         @Flag(name: .long, help: "Also split each call into pad / mel / encoder / decode.")
         var stages: Bool = false
 
-        @Flag(name: .long, help: "Measure even if the model still has to be downloaded.")
+        @Flag(name: .long, help: "Measure even if a model still has to be downloaded.")
         var allowDownload: Bool = false
 
         @Flag(name: .long, help: "Emit machine-readable JSON instead of the text report.")
@@ -236,9 +257,18 @@ struct Bench: ParsableCommand {
             if iterations < 1 {
                 throw ValidationError("--iterations must be at least 1.")
             }
+            if gap < 0 || gap > LIDSweepInput.maxGapSeconds {
+                throw ValidationError(String(
+                    format: "--gap must be between 0 and %g seconds.", LIDSweepInput.maxGapSeconds
+                ))
+            }
+            if let observed, observed <= 0 {
+                throw ValidationError("--observed is a latency in milliseconds; it must be positive.")
+            }
             do {
                 _ = try LIDSweepInput.durations(durations)
                 _ = try LIDSweepInput.signals(signals)
+                _ = try LIDSweepInput.arms(arms)
             } catch let error as LIDSweepInput.ParseError {
                 throw ValidationError(error.description)
             }
@@ -252,24 +282,61 @@ struct Bench: ParsableCommand {
                 throw fail("\(model.id) is not multilingual — language detection needs a "
                     + "multilingual model (the default is \(BilingualConfiguration.lidModelID)).")
             }
-            if !Bench.WarmUp.notDownloaded([model]).isEmpty, !allowDownload {
-                throw fail("not measured — \(model.id) is not on disk.\n"
-                    + "  → parrot models download \(model.id)\n"
-                    + "pass --allow-download to download it as part of the run.")
+
+            let arms = try LIDSweepInput.arms(self.arms)
+            var bilingual: BilingualConfiguration?
+            if arms.contains(where: \.needsFullModelSet) {
+                // The three-model arms route through RoutingTranscriber, which
+                // always identifies on `BilingualConfiguration.lidModelID`. If
+                // --lid-model says otherwise the arms would not be timing the
+                // same model, and the difference between them would mean nothing.
+                guard model.id == BilingualConfiguration.lidModelID else {
+                    throw fail("--lid-model \(model.id) cannot be compared against the "
+                        + "three-model arms: bilingual mode always identifies on "
+                        + "\(BilingualConfiguration.lidModelID), so the arms would be timing "
+                        + "different models.\n"
+                        + "  → drop --lid-model, or run --arms lid-only.")
+                }
+                do {
+                    bilingual = try BilingualConfiguration(
+                        norwegianModelID: noModel, englishModelID: enModel
+                    )
+                } catch {
+                    throw fail("\(error)")
+                }
+            }
+
+            let needed = bilingual?.models ?? [model]
+            let missing = Bench.WarmUp.notDownloaded(needed)
+            if !missing.isEmpty, !allowDownload {
+                var lines = ["not measured — these models are not on disk:"]
+                for m in missing {
+                    lines.append("  ✗ \(m.id)  → parrot models download \(m.id)")
+                }
+                lines.append("pass --allow-download to download them as part of the run.")
+                throw fail(lines.joined(separator: "\n"))
             }
 
             let lengths = try LIDSweepInput.durations(durations)
             let signalSet = try LIDSweepInput.signals(signals)
-            let iterations = self.iterations
-            let withStages = stages
-            let box = ResultBox<LIDMeasurement>()
+            let plan = SweepPlan(
+                lidModel: model,
+                bilingual: bilingual,
+                arms: arms,
+                lengths: lengths,
+                signals: signalSet,
+                iterations: iterations,
+                stages: stages,
+                gapSeconds: gap
+            )
+            let observed = self.observed
+            let box = ResultBox<LIDComparison>()
             let semaphore = DispatchSemaphore(value: 0)
             Task.detached {
                 do {
-                    box.set(.success(try await Self.sweep(
-                        model: model, lengths: lengths, signals: signalSet,
-                        iterations: iterations, stages: withStages
-                    )))
+                    var comparison = try await Self.compare(plan)
+                    comparison.observedDaemonMillis = observed
+                    box.set(.success(comparison))
                 } catch {
                     box.set(.failure(error))
                 }
@@ -280,45 +347,137 @@ struct Bench: ParsableCommand {
             switch box.get() {
             case let .failure(error):
                 throw fail("lid bench failed: \(error)")
-            case let .success(measurement):
-                print(json ? LIDReport.json(measurement) : LIDReport.text(measurement))
+            case let .success(comparison):
+                print(json ? LIDReport.json(comparison) : LIDReport.text(comparison))
             case .none:
                 throw fail("lid bench produced no result")
             }
         }
 
-        /// Loads the LID pipeline once, pays the cold call once, then times
-        /// every (signal, length) cell against the same warm pipeline — the
-        /// state the daemon is in for every utterance after the first.
-        private static func sweep(
-            model: TranscriptionModel,
-            lengths: [Double],
-            signals: [SyntheticAudio.Signal],
-            iterations: Int,
-            stages: Bool
-        ) async throws -> LIDMeasurement {
-            let pipeline = try await LIDPipeline.load(model)
+        /// Everything the sweep needs, gathered so it crosses the concurrency
+        /// boundary as one value.
+        private struct SweepPlan: @unchecked Sendable {
+            let lidModel: TranscriptionModel
+            let bilingual: BilingualConfiguration?
+            let arms: [LIDArm]
+            let lengths: [Double]
+            let signals: [SyntheticAudio.Signal]
+            let iterations: Int
+            let stages: Bool
+            let gapSeconds: Double
+        }
 
+        /// Runs each requested arm in turn, in one process.
+        ///
+        /// Order is forced by `LIDSweepInput.arms` and it matters: a loaded
+        /// CoreML pipeline cannot be unloaded, so `lid-only` is only honest
+        /// before the other two models exist. The standalone LID pipeline is
+        /// released before the router is built, or whisper-tiny would be
+        /// resident twice and the residency term would count a model the daemon
+        /// does not hold.
+        private static func compare(_ plan: SweepPlan) async throws -> LIDComparison {
+            var standalone: WhisperKit?
+            var router: RoutingTranscriber?
+            var results: [LIDMeasurement] = []
+
+            for arm in plan.arms {
+                FileHandle.standardError.write(Data(
+                    "◐ arm \(arm.rawValue) — \(arm.summary)\n".utf8
+                ))
+                let pipeline: WhisperKit
+                let residentIDs: [String]
+                let call: LIDCall
+
+                switch arm {
+                case .lidOnly:
+                    let loaded = try await LIDPipeline.load(plan.lidModel)
+                    standalone = loaded
+                    pipeline = loaded
+                    residentIDs = [plan.lidModel.id]
+                    call = { try await loaded.detectLangauge(audioArray: $0).language }
+
+                case .threeResident, .daemon:
+                    guard let bilingual = plan.bilingual else {
+                        throw LIDBenchError.stageFailed(
+                            "arm \(arm.rawValue) needs the bilingual model set"
+                        )
+                    }
+                    if router == nil {
+                        standalone = nil
+                        let built = RoutingTranscriber(configuration: bilingual)
+                        try await built.warmUp()
+                        router = built
+                    }
+                    guard let router, let resident = await router.residentLIDPipeline() else {
+                        throw LIDBenchError.stageFailed("routing transcriber has no LID pipeline")
+                    }
+                    pipeline = resident
+                    residentIDs = bilingual.models.map(\.id)
+                    if arm == .threeResident {
+                        call = { try await resident.detectLangauge(audioArray: $0).language }
+                    } else {
+                        // identifyLanguage swallows a LID failure by design —
+                        // the daemon falls through to the default route rather
+                        // than dropping the utterance. The bench must not: a
+                        // failing call is fast, and timing it would report a
+                        // flattering median for something that never worked.
+                        call = {
+                            let outcome = try await router.identifyLanguage($0)
+                            if let failure = outcome.failure {
+                                throw LIDBenchError.stageFailed("detectLangauge failed: \(failure)")
+                            }
+                            return outcome.language
+                        }
+                    }
+                }
+
+                results.append(try await sweep(
+                    arm: arm,
+                    plan: plan,
+                    pipeline: pipeline,
+                    residentModelIDs: residentIDs,
+                    call: call
+                ))
+            }
+            // Keep both alive until every arm is done: releasing mid-sweep
+            // would change what is resident under a later arm.
+            withExtendedLifetime((standalone, router)) {}
+            return LIDComparison(arms: results)
+        }
+
+        /// Pays the cold call once, then times every (signal, length) cell
+        /// against the same warm pipeline — the state the daemon is in for
+        /// every utterance after the first.
+        private static func sweep(
+            arm: LIDArm,
+            plan: SweepPlan,
+            pipeline: WhisperKit,
+            residentModelIDs: [String],
+            call: LIDCall
+        ) async throws -> LIDMeasurement {
             // The first call after load pays for lazy CoreML setup — the 803 ms
             // outlier in the gh#20 session log. Timed once, reported once, and
-            // kept out of every cell.
-            let longest = lengths.max() ?? 30
+            // kept out of every cell. Only the first arm sees a real cold call;
+            // later arms share the process and report their own anyway, because
+            // "cold" for them is a different and still interesting thing.
+            let longest = plan.lengths.max() ?? 30
             let cold = try await time {
-                _ = try await pipeline.detectLangauge(
-                    audioArray: SyntheticAudio.make(.noise, seconds: longest)
-                )
+                _ = try await call(SyntheticAudio.make(.noise, seconds: longest))
             }
-            FileHandle.standardError.write(Data(String(format: "◐ lid cold · %.1fms\n", cold).utf8))
+            FileHandle.standardError.write(Data(String(
+                format: "◐ lid cold · %.1fms\n", cold
+            ).utf8))
 
             var cells: [LIDCell] = []
-            for signal in signals {
-                for seconds in lengths {
+            for signal in plan.signals {
+                for seconds in plan.lengths {
                     let audio = SyntheticAudio.make(signal, seconds: seconds)
                     var millis: [Double] = []
                     var detected: String?
-                    for _ in 0..<iterations {
+                    for _ in 0..<plan.iterations {
+                        try await idle(plan.gapSeconds)
                         let elapsed = try await time {
-                            detected = try await pipeline.detectLangauge(audioArray: audio).language
+                            detected = try await call(audio)
                         }
                         millis.append(elapsed)
                     }
@@ -338,26 +497,39 @@ struct Bench: ParsableCommand {
             }
 
             var breakdowns: [LIDStageBreakdown] = []
-            if stages {
-                for seconds in lengths {
+            if plan.stages {
+                for seconds in plan.lengths {
                     breakdowns.append(try await stageBreakdown(
                         pipeline: pipeline,
-                        signal: signals.first ?? .noise,
+                        call: call,
+                        signal: plan.signals.first ?? .noise,
                         seconds: seconds,
-                        iterations: iterations
+                        iterations: plan.iterations
                     ))
                 }
             }
 
             return LIDMeasurement(
-                modelID: model.id,
+                modelID: plan.lidModel.id,
                 sampleRate: AudioCapture.targetSampleRate,
                 windowSamples: pipeline.featureExtractor.windowSamples,
                 coldMillis: cold,
                 cells: cells,
                 stages: breakdowns,
-                optimizedBuild: optimizedBuild
+                optimizedBuild: optimizedBuild,
+                arm: arm,
+                residentModelIDs: residentModelIDs,
+                gapSeconds: plan.gapSeconds
             )
+        }
+
+        /// Waits `seconds` before the next timed call. A tight loop keeps the
+        /// ANE clocked up and the weights hot; the daemon's calls are seconds
+        /// or minutes apart. `--gap` is how that difference gets measured
+        /// rather than assumed away.
+        private static func idle(_ seconds: Double) async throws {
+            guard seconds > 0 else { return }
+            try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
         }
 
         /// Times `detectLangauge`'s own stages — pad, mel, encoder — through
@@ -365,8 +537,13 @@ struct Bench: ParsableCommand {
         /// call for the residual. Reproduces `WhisperKit.detectLangauge`'s
         /// prologue exactly: pad or trim to the feature extractor's window,
         /// mel, encode.
+        ///
+        /// `call` is the arm's own full call, so on the `daemon` arm the
+        /// residual carries the daemon's call path as well as the decode step
+        /// — which is the point of splitting the arms in the first place.
         private static func stageBreakdown(
             pipeline: WhisperKit,
+            call: LIDCall,
             signal: SyntheticAudio.Signal,
             seconds: Double,
             iterations: Int
@@ -399,7 +576,7 @@ struct Bench: ParsableCommand {
                     _ = try await pipeline.audioEncoder.encodeFeatures(features)
                 })
                 total.append(try await time {
-                    _ = try await pipeline.detectLangauge(audioArray: audio)
+                    _ = try await call(audio)
                 })
             }
             let breakdown = LIDStageBreakdown(
@@ -440,6 +617,13 @@ struct Bench: ParsableCommand {
         }
     }
 }
+
+/// One arm's way of running a single LID pass: hand it audio, get the detected
+/// language back. `lid-only` and `three-resident` bind this to
+/// `WhisperKit.detectLangauge`; `daemon` binds it to
+/// `RoutingTranscriber.identifyLanguage`. Everything else about the sweep is
+/// identical across arms, so the closure is the whole difference between them.
+typealias LIDCall = @Sendable ([Float]) async throws -> String?
 
 enum LIDBenchError: Error, CustomStringConvertible {
     /// A stage of the hand-rolled `detectLangauge` breakdown returned nothing.

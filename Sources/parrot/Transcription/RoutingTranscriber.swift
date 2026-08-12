@@ -67,50 +67,80 @@ actor RoutingTranscriber: Transcriber {
         warmedUp = true
     }
 
+    /// One language-identification pass, exactly as `transcribe` runs it.
+    ///
+    /// Split out of `transcribe` for gh#25: `parrot bench lid --arms daemon`
+    /// times *this* method, so the bench measures the code path an utterance
+    /// takes rather than a reimplementation of it that can drift. Everything
+    /// inside the daemon's timed span lives here — the window copy, the
+    /// `detectLangauge` call, the softmax over `langProbs` — and so does the
+    /// `◐ lid` log line, so a bench run and a live session print the same shape.
+    ///
+    /// Never throws on a LID failure: the caller falls through to the default
+    /// route, which is the behaviour the daemon has always had.
+    func identifyLanguage(_ audio: [Float]) async throws -> LIDOutcome {
+        if !warmedUp { try await warmUp() }
+        guard let lidPipeline else { throw TranscriberError.notLoaded }
+
+        let started = Date()
+        do {
+            let window = audio.count > Self.lidWindowSamples
+                ? Array(audio.prefix(Self.lidWindowSamples)) : audio
+            // (sic — WhisperKit 0.18 spells it "detectLangauge")
+            let detection = try await lidPipeline.detectLangauge(audioArray: window)
+            let millis = Date().timeIntervalSince(started) * 1000
+            // langProbs carries log-probabilities of the language tokens
+            // (softmax over the <|lang|> distribution). The whole softmax, not
+            // just the top-1 entry: below τ = 0.5 more than one route can clear
+            // its gate, and the policy needs every route's mass to say which
+            // cleared it by more.
+            let distribution = detection.langProbs.mapValues { exp($0) }
+            let probability = distribution[detection.language]
+            log(String(format: "◐ lid %@ %.2f · %dms\n",
+                       detection.language, probability ?? 0, Int(millis)))
+            return LIDOutcome(
+                language: detection.language,
+                probability: probability,
+                distribution: distribution,
+                millis: millis
+            )
+        } catch {
+            // LID failure is not fatal — the caller falls through to the
+            // default route.
+            let millis = Date().timeIntervalSince(started) * 1000
+            log("◐ lid failed (\(error)) → default route\n")
+            return LIDOutcome(
+                language: nil, probability: nil, distribution: [:],
+                millis: millis, failure: "\(error)"
+            )
+        }
+    }
+
+    /// The loaded LID pipeline, for `parrot bench lid`'s `three-resident` arm:
+    /// the same `detectLangauge` handle the `lid-only` arm times, but reached
+    /// while the Norwegian and English pipelines are also resident. nil before
+    /// `warmUp()`. Not used by the daemon itself.
+    func residentLIDPipeline() -> WhisperKit? { lidPipeline }
+
     func transcribe(_ audio: [Float]) async throws -> String {
         if !warmedUp { try await warmUp() }
 
         let seconds = Double(audio.count) / AudioCapture.targetSampleRate
         let policy = configuration.policy
 
-        var language: String?
-        var probability: Float?
-        // The whole softmax, not just the top-1 entry: below τ = 0.5 more than
-        // one route can clear its gate, and the policy needs every route's mass
-        // to say which cleared it by more.
-        var distribution: [String: Float] = [:]
-        var lidMillis = 0
-
+        var lid = LIDOutcome.skipped
         if policy.shouldRunLID(seconds: seconds) {
-            guard let lidPipeline else { throw TranscriberError.notLoaded }
-            let started = Date()
-            do {
-                let window = audio.count > Self.lidWindowSamples
-                    ? Array(audio.prefix(Self.lidWindowSamples)) : audio
-                // (sic — WhisperKit 0.18 spells it "detectLangauge")
-                let detection = try await lidPipeline.detectLangauge(audioArray: window)
-                lidMillis = Int(Date().timeIntervalSince(started) * 1000)
-                language = detection.language
-                // langProbs carries log-probabilities of the language tokens
-                // (softmax over the <|lang|> distribution).
-                distribution = detection.langProbs.mapValues { exp($0) }
-                probability = distribution[detection.language]
-                log(String(format: "◐ lid %@ %.2f · %dms\n",
-                           detection.language, probability ?? 0, lidMillis))
-            } catch {
-                // LID failure is not fatal — fall through to the default route.
-                lidMillis = Int(Date().timeIntervalSince(started) * 1000)
-                log("◐ lid failed (\(error)) → default route\n")
-            }
+            lid = try await identifyLanguage(audio)
         } else {
             log(String(format: "◐ lid skip (%.2fs < %.1fs) → %@\n",
                        seconds, policy.minLIDSeconds, policy.defaultRoute.rawValue))
         }
+        let lidMillis = Int(lid.millis)
 
-        let route = policy.route(distribution: distribution, seconds: seconds)
+        let route = policy.route(distribution: lid.distribution, seconds: seconds)
         lastRoute = route
 
-        if let language, let probability {
+        if let language = lid.language, let probability = lid.probability {
             lastDecision = String(format: "%@→%@ %.2f · %dms",
                                   language, route.rawValue, probability, lidMillis)
         } else {
@@ -140,6 +170,27 @@ actor RoutingTranscriber: Transcriber {
     private func log(_ message: String) {
         FileHandle.standardError.write(Data(message.utf8))
     }
+}
+
+/// The result of one LID pass, as `RoutingTranscriber.identifyLanguage`
+/// produces it. `millis` is the span the daemon logs as `◐ lid … · NNms` —
+/// window copy plus `detectLangauge`, measured the way the daemon measures it.
+struct LIDOutcome: Sendable {
+    let language: String?
+    let probability: Float?
+    /// The full softmax over language tokens; empty when LID did not run or
+    /// failed. The policy routes on this, not on `language` alone.
+    let distribution: [String: Float]
+    let millis: Double
+    /// Set when `detectLangauge` threw — the caller takes the default route.
+    var failure: String?
+
+    /// LID was never run (utterance too short). Distinct from a failure: no
+    /// time was spent and no distribution exists either way, but the daemon
+    /// logs the two differently.
+    static let skipped = LIDOutcome(
+        language: nil, probability: nil, distribution: [:], millis: 0
+    )
 }
 
 enum RoutingTranscriberError: Error, CustomStringConvertible {

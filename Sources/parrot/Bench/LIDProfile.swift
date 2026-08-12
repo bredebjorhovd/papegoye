@@ -45,6 +45,40 @@ enum SyntheticAudio {
     }
 }
 
+/// What the sweep holds resident and which call path it times (gh#25).
+///
+/// gh#20 measured `lid-only` and got 19.6 ms; the live daemon on the same
+/// release build was ~52 ms. The two extra arms exist to say *which* of the
+/// differences between those two situations costs the time, by changing one
+/// thing at a time:
+///
+///   lid-only        1 model resident,  `detectLangauge` called directly
+///   three-resident  3 models resident, `detectLangauge` called directly
+///   daemon          3 models resident, called through `RoutingTranscriber`
+///
+/// So `three-resident − lid-only` is the price of the other two pipelines
+/// being loaded, and `daemon − three-resident` is the price of the daemon's
+/// own call path around the same `detectLangauge`.
+enum LIDArm: String, CaseIterable, Sendable {
+    case lidOnly = "lid-only"
+    case threeResident = "three-resident"
+    case daemon
+
+    /// True when the arm needs the Norwegian and English pipelines loaded too.
+    var needsFullModelSet: Bool { self != .lidOnly }
+
+    var summary: String {
+        switch self {
+        case .lidOnly:
+            return "1 model resident, detectLangauge called directly"
+        case .threeResident:
+            return "3 models resident, detectLangauge called directly"
+        case .daemon:
+            return "3 models resident, called through RoutingTranscriber"
+        }
+    }
+}
+
 /// docs/bilingual.md "Budgets": LID ≤ 30 ms on ANE for a ≤ 10 s utterance.
 enum LIDBudget {
     static let millis: Double = 30
@@ -233,6 +267,15 @@ struct LIDMeasurement: Sendable {
     /// several times slower in a debug build, so a debug number cannot be
     /// judged against the budget.
     var optimizedBuild: Bool = true
+    /// What was resident and which call path was timed.
+    var arm: LIDArm = .lidOnly
+    /// Every model held loaded for this arm, in load order. One entry for
+    /// `lid-only`, three for the others.
+    var residentModelIDs: [String] = []
+    /// Idle seconds inserted before each timed call (`--gap`). Zero means the
+    /// calls were made back to back, which is not what the daemon does — see
+    /// `LIDComparison`.
+    var gapSeconds: Double = 0
 
     var windowSeconds: Double? {
         guard let windowSamples, sampleRate > 0 else { return nil }
@@ -261,6 +304,188 @@ struct LIDMeasurement: Sendable {
     }
 }
 
+/// Splits the gh#25 gap — bench 19.6 ms vs live daemon ~52 ms — into the
+/// pieces this bench can actually attribute, and names what is left over.
+///
+/// Arithmetic only, over three in-scope medians. Each term changes exactly one
+/// thing relative to the arm above it, so a term is the cost of that one
+/// change:
+///
+///   residency  three-resident − lid-only        the other two pipelines being loaded
+///   call path  daemon − three-resident          RoutingTranscriber around detectLangauge
+///   remainder  observed − daemon                everything this bench does not model
+///
+/// The remainder is the honest part. Whatever it is, it is not resident models
+/// and not the call path, because those were measured.
+struct LIDAttribution: Sendable {
+    /// What gh#20 measured: LID alone, called directly.
+    let baseline: Double
+    /// nil when that arm did not run.
+    let threeResident: Double?
+    let daemon: Double?
+    /// Median from a live daemon session, passed in with `--observed`. The
+    /// bench cannot measure this itself — it has no microphone.
+    let observed: Double?
+
+    /// A term counts as explaining the gap at or above this share of it.
+    /// Below a quarter it is real but not the answer.
+    static let materialShare: Double = 0.25
+
+    /// How far the daemon-like arm may sit from the live daemon and still be
+    /// called a reproduction. ±25% of a ~50 ms number is ~12 ms, which is
+    /// inside the spread a single arm shows between its own calls.
+    static let reproductionTolerance: Double = 0.25
+
+    /// Cost of holding the Norwegian and English pipelines resident.
+    var residencyCost: Double? {
+        threeResident.map { $0 - baseline }
+    }
+
+    /// Cost of the daemon's call path around the same `detectLangauge`: the
+    /// actor hop, the window copy, the softmax over `langProbs`.
+    var callPathCost: Double? {
+        guard let daemon, let threeResident else { return nil }
+        return daemon - threeResident
+    }
+
+    /// A term that came out negative is not a saving — loading a second model
+    /// cannot make LID faster, and neither can wrapping it in an actor. It is
+    /// direct evidence that the run-to-run spread is wider than the effect, so
+    /// the term is reported as unmeasurable rather than as a number.
+    static func isMeasurable(_ term: Double?) -> Bool {
+        guard let term else { return false }
+        return term > 0
+    }
+
+    /// How much of the live daemon's latency the most daemon-like arm actually
+    /// reproduces. 0.33 means the bench is timing something three times faster
+    /// than the thing it claims to model; 1.0 means it is timing the same
+    /// thing. nil without `--observed`.
+    var reproduction: Double? {
+        guard let observed, observed > 0, let top = daemon ?? threeResident else { return nil }
+        return top / observed
+    }
+
+    /// True when the arms land on the live daemon's number. Whatever conditions
+    /// the run used are then the daemon's conditions, and there is no gap left
+    /// to split between residency and the call path.
+    var reproducesDaemon: Bool {
+        guard let reproduction else { return false }
+        return abs(reproduction - 1) <= Self.reproductionTolerance
+    }
+
+    /// The gap being attributed: the live daemon against gh#20's number when
+    /// `--observed` was given, otherwise as much of it as the arms reproduce.
+    var gap: Double? {
+        guard let top = observed ?? daemon else { return nil }
+        return top - baseline
+    }
+
+    /// What the arms account for. Only measurable terms count: a negative one
+    /// contributes nothing rather than cancelling out a real cost beside it.
+    var explained: Double? {
+        let terms = [residencyCost, callPathCost].filter(Self.isMeasurable).compactMap { $0 }
+        return terms.isEmpty ? nil : terms.reduce(0, +)
+    }
+
+    /// The part of the gap no arm reached. nil without `--observed`: with only
+    /// bench arms the remainder is zero by construction and printing it would
+    /// read as a result.
+    var unexplained: Double? {
+        guard let observed, let daemon else { return nil }
+        return observed - daemon
+    }
+
+    /// A term's share of the gap. Unmeasurable terms have no share — printing
+    /// "-368% call path" would dress noise up as a finding.
+    private func share(_ value: Double?) -> Double? {
+        guard Self.isMeasurable(value), let value, let gap, gap > 0 else { return nil }
+        return value / gap
+    }
+
+    var residencyShare: Double? { share(residencyCost) }
+    var callPathShare: Double? { share(callPathCost) }
+    var unexplainedShare: Double? { share(unexplained) }
+
+    enum Verdict: Sendable, Equatable {
+        /// The arms land on the live daemon's number. There is no gap left to
+        /// attribute — this run's conditions are the daemon's conditions.
+        case reproducesDaemon
+        /// Resident models cost a material share of the gap — the ANE
+        /// contention hypothesis, and it would bear on the memory item too.
+        case residency
+        /// The daemon's call path costs a material share.
+        case callPath
+        /// The arms reproduce little of the gap. Not contention, not the call
+        /// path — those were measured.
+        case unexplained
+        /// Not enough arms, or nothing to attribute.
+        case notAttributable
+    }
+
+    var verdict: Verdict {
+        // Checked before any share arithmetic: once the arms match the daemon,
+        // the residual gap is small enough that ordinary run-to-run spread
+        // divided by it produces enormous, meaningless shares.
+        if reproducesDaemon { return .reproducesDaemon }
+        guard let gap, gap > 0 else { return .notAttributable }
+        let candidates: [(Verdict, Double)] = [
+            (.residency, residencyShare ?? 0),
+            (.callPath, callPathShare ?? 0),
+            (.unexplained, unexplainedShare ?? 0),
+        ]
+        guard let top = candidates.max(by: { $0.1 < $1.1 }),
+              top.1 >= Self.materialShare
+        else {
+            // Nothing clears the bar: with an observed number that itself means
+            // the gap is spread thin or elsewhere; without one, there is not
+            // enough to rank.
+            return unexplained == nil ? .notAttributable : .unexplained
+        }
+        return top.0
+    }
+}
+
+/// One `parrot bench lid` invocation: one arm, or several run back to back in
+/// the same process for comparison.
+struct LIDComparison: Sendable {
+    let arms: [LIDMeasurement]
+    /// Median `◐ lid … · NNms` from a live daemon session, if the caller
+    /// supplied one with `--observed`. gh#25 quotes ~52 ms.
+    var observedDaemonMillis: Double?
+
+    var isSingleArm: Bool { arms.count < 2 }
+
+    func measurement(_ arm: LIDArm) -> LIDMeasurement? {
+        arms.first { $0.arm == arm }
+    }
+
+    func median(_ arm: LIDArm) -> Double? {
+        measurement(arm)?.inScopeMedian
+    }
+
+    /// nil unless the `lid-only` arm ran: every term is a difference from it.
+    var attribution: LIDAttribution? {
+        guard let baseline = median(.lidOnly) else { return nil }
+        return LIDAttribution(
+            baseline: baseline,
+            threeResident: median(.threeResident),
+            daemon: median(.daemon),
+            observed: observedDaemonMillis
+        )
+    }
+
+    /// The arm to judge against the 30 ms budget: the most daemon-like one
+    /// that ran. A pass on `lid-only` is what gh#20 already had, and gh#25 is
+    /// the finding that it did not carry over.
+    var judgedArm: LIDMeasurement? {
+        for arm in [LIDArm.daemon, .threeResident, .lidOnly] {
+            if let m = measurement(arm) { return m }
+        }
+        return nil
+    }
+}
+
 /// Parsing for the sweep options, kept pure so the error messages are testable
 /// without running a model.
 enum LIDSweepInput {
@@ -268,11 +493,16 @@ enum LIDSweepInput {
     /// only measuring `padOrTrim` on a buffer the encoder never sees.
     static let maxSeconds: Double = 120
 
+    /// Longest idle the sweep will insert between calls (`--gap`). Past this a
+    /// run stops being a benchmark and becomes an afternoon.
+    static let maxGapSeconds: Double = 300
+
     enum ParseError: Error, CustomStringConvertible {
         case notANumber(String)
         case outOfRange(Double)
         case empty
         case unknownSignal(String)
+        case unknownArm(String)
 
         var description: String {
             switch self {
@@ -288,8 +518,30 @@ enum LIDSweepInput {
             case let .unknownSignal(raw):
                 return "unknown signal: '\(raw)' — pick from "
                     + SyntheticAudio.Signal.allCases.map(\.rawValue).joined(separator: ", ")
+            case let .unknownArm(raw):
+                return "unknown arm: '\(raw)' — pick from "
+                    + LIDArm.allCases.map(\.rawValue).joined(separator: ", ") + ", or all"
             }
         }
+    }
+
+    /// Arms always run cheapest-residency first and in a fixed order, whatever
+    /// order they were asked for: the `lid-only` arm is only honest while the
+    /// other two pipelines have not been loaded yet, and a loaded pipeline
+    /// cannot be unloaded again inside one process.
+    static func arms(_ raw: String) throws -> [LIDArm] {
+        let fields = raw.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        guard !fields.isEmpty else { throw ParseError.empty }
+        var out: Set<LIDArm> = []
+        for field in fields {
+            if field == "all" {
+                out.formUnion(LIDArm.allCases)
+                continue
+            }
+            guard let arm = LIDArm(rawValue: field) else { throw ParseError.unknownArm(field) }
+            out.insert(arm)
+        }
+        return LIDArm.allCases.filter(out.contains)
     }
 
     static func durations(_ raw: String) throws -> [Double] {

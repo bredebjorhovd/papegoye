@@ -178,6 +178,7 @@ parrot bench lid                                  # 1,2,5,10,30 s on noise, 5 ca
 parrot bench lid --durations 1,10 --signals all   # silence / noise / tone at two lengths
 parrot bench lid --stages                         # also split pad / mel / encoder / decode
 parrot bench lid --json                           # machine-readable
+parrot bench lid --arms all --gap 10 --observed 52  # the gh#25 comparison, below
 ```
 
 LID *latency* depends on how much audio the model is handed, never on what the
@@ -227,15 +228,93 @@ Two findings, both of which change what the fix would be:
    from ~45 ms to ~8 ms. The report prints which build it measured and refuses
    to call a debug run a verdict.
 
-The remaining gap between ~52 ms here and the 66–89 ms in the field is
-unexplained — the session had three pipelines resident and a decode running
-straight after each LID call. **Not yet done: re-measure in a live release
-build with a microphone.** Until then the acceptance item stays open; a
-synthetic bench passing is not the same as the daemon passing.
-
 The default window is unchanged in either case (the ticket asked for numbers,
 not a change), and nothing here measures ANE residency — that needs
 `sudo powermetrics`.
+
+### Why that number did not predict the daemon (gh#25)
+
+The release-build sweep above passed at ~15–20 ms. Minutes later, on the same
+machine and the same binary, the live daemon logged 46–74 ms — median ~52 ms,
+1.7× over budget. Both numbers are real. The difference is everything the
+sweep did not model, and `--arms` / `--gap` exist to find out which part.
+
+`--arms` changes one thing at a time:
+
+| arm | resident | timed call |
+| --- | --- | --- |
+| `lid-only` | LID pipeline only | `detectLangauge` directly |
+| `three-resident` | all three pipelines | `detectLangauge` directly |
+| `daemon` | all three pipelines | `RoutingTranscriber.identifyLanguage` |
+
+So `three-resident − lid-only` is the price of the other two models being
+loaded, and `daemon − three-resident` is the price of the daemon's own call
+path. The `daemon` arm calls the same method `transcribe` calls — it is not a
+reimplementation of the daemon's LID stage that can drift away from it.
+
+`--gap` inserts idle time before each timed call. A benchmark loop calls
+`detectLangauge` again immediately; a person dictating calls it once every
+several seconds.
+
+**Measured 2026-08-12, M-series, release build, `--durations 2,10
+--iterations 5 --observed 52`:**
+
+```
+  median over in-scope cells      --gap 0    --gap 10
+  lid-only                         20.0ms      47.2ms
+  three-resident                   20.9ms      44.3ms
+  daemon                           20.3ms      43.2ms
+  live daemon (--observed)         52.0ms      52.0ms
+
+  residency  (three-resident − lid-only)   +0.9ms      −3.0ms
+  call path  (daemon − three-resident)     −0.6ms      −1.0ms
+  reproduction of the live daemon             39%         83%
+```
+
+Three findings:
+
+1. **It is not resident models.** Holding NB-Whisper and English Whisper
+   loaded costs the LID pass 0.9 ms — 3% of the 32 ms gap, and it lands below
+   the run-to-run spread in the spaced run. The ANE-contention hypothesis in
+   gh#25 is not supported, which also means it is *not* an argument against
+   the memory acceptance item or against a third route.
+2. **It is not the daemon's call path.** The actor hop, the window copy and
+   the softmax over `langProbs` come out *negative* in both runs. Loading a
+   second model cannot make LID faster and neither can wrapping it in an
+   actor, so a negative term is the spread showing through — the report says
+   "below run-to-run spread" rather than printing it as a saving.
+3. **It is the time since the previous LID call.** Back to back, LID is
+   ~20 ms. With 10 s of idle in front of each call it is ~43–47 ms, 83% of the
+   live daemon's 52 ms — reached from synthetic audio, with no microphone. The
+   climb runs across the whole range and flattens out around 10 s:
+
+   ```
+   --gap      0s   0.5s     1s     2s     5s    10s    30s
+   median   21.6   24.1   28.4   26.4   32.7   52.7   48.3  ms
+   ```
+
+   (daemon arm, 5 s noise, one invocation per point — the spread between
+   neighbouring points is wider than the step between them, but the trend
+   across the range is far larger than either.)
+
+So gh#20's 15–20 ms was not wrong, it was measured under conditions no user
+ever reproduces. Any LID number quoted from a back-to-back loop is a number
+for the second call onwards, and every call the daemon makes is a first call.
+**A bench that hammers a model measures a warm model, not the product.**
+
+What this does *not* establish: the mechanism. Whether the idle cost is ANE
+clock ramp, the compiled model being evicted from the ANE's cache, or CoreML
+re-entry is not distinguishable from wall-clock timings — that needs
+`sudo powermetrics --samplers ane_power`. And one candidate from gh#25 is
+still unreached: the daemon calls LID immediately after audio capture stops,
+so capture teardown may compete with it. Reproducing that needs a microphone.
+
+The acceptance item stays **open and failing**: LID in the daemon is ~52 ms
+against a 30 ms budget, and that is now a reproducible bench result rather
+than a field anecdote. The obvious lead for a fix is that the daemon knows
+the user is recording *before* it needs LID — a keep-alive call on hotkey-down
+would land the pipeline in its ~20 ms state by the time recording stops. Not
+done here; gh#25 asked for the attribution, not the fix.
 
 ## CLI
 
@@ -257,7 +336,9 @@ parrot doctor --bilingual              # checks the bilingual model set is downl
   ratio vs the 1.5× budget, and the "not overlapping" flag. No models needed.
 - `swift test --filter LIDProfileTests` — LID latency analysis: synthetic
   signal generation, the fixed-cost vs tracks-length verdict, budget scope,
-  and the debug-build warning. No models needed.
+  the debug-build warning, and the gh#25 arm attribution (including that a
+  negative term is reported as run-to-run spread, not as a saving). No models
+  needed.
 - `PARROT_INTEGRATION=1 swift test --filter RoutingIntegrationTests` —
   fixture WAVs → assert route + transcript emptiness; see
   `Tests/fixtures/README.md`. Fixtures are recorded with `--dump-wav`.
