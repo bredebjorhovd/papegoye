@@ -31,6 +31,7 @@ enum DoctorReport {
             checkInputDevice(AudioDevices.resolve(preference: inputPreference)),
             checkAccessibility(),
             checkFnKeyMapping(),
+            checkModelCacheLocation(),
         ]
         for m in models {
             checks.append(checkModelDownloaded(m))
@@ -38,9 +39,37 @@ enum DoctorReport {
         return checks
     }
 
-    /// WhisperKit (via swift-transformers' HubApi) downloads models to
-    /// ~/Documents/huggingface/models/<repo>/<variant>. A model with an
-    /// explicit `modelFolder` is checked at that path instead.
+    /// A cache inside an iCloud-synced folder is both a quiet ~1 GB upload and
+    /// the cause of the `EDEADLK` bilingual warm-up failure (gh#34), so say so
+    /// even though nothing is broken yet on this machine.
+    static func checkModelCacheLocation() -> Check {
+        let name = "model cache"
+        let legacy = ModelCache.documentsBase
+        guard ModelCache.directoryNonEmpty(legacy.path) else {
+            return Check(
+                name: name,
+                status: .ok,
+                remediation: nil,
+                detail: ModelCache.applicationSupportBase.appendingPathComponent("models").path
+            )
+        }
+        guard ModelCache.isInSyncedFolder(legacy) else {
+            return Check(name: name, status: .ok, remediation: nil, detail: legacy.path)
+        }
+        let evicted = ModelCache.evictedFileCount(under: legacy)
+        let evictionNote = evicted > 0
+            ? " — iCloud has already evicted \(evicted) file\(evicted == 1 ? "" : "s"), which breaks bilingual warm-up"
+            : ""
+        return Check(
+            name: name,
+            status: .warn("in an iCloud-synced folder: \(legacy.path)\(evictionNote)"),
+            remediation: "parrot models migrate — moves it to \(ModelCache.applicationSupportBase.appendingPathComponent("models").path)"
+        )
+    }
+
+    /// WhisperKit (via swift-transformers' HubApi) caches models at
+    /// <base>/models/<repo>/<variant>, where the base comes from `ModelCache`.
+    /// A model with an explicit `modelFolder` is checked at that path instead.
     static func checkModelDownloaded(_ model: TranscriptionModel) -> Check {
         let name = "model \(model.id)"
         if let folder = model.modelFolder {
@@ -56,15 +85,12 @@ enum DoctorReport {
         guard let variant = model.whisperKitID else {
             return Check(name: name, status: .fail("no engine id"), remediation: nil)
         }
-        let repo = model.modelRepo ?? "argmaxinc/whisperkit-coreml"
-        let repoDir = FileManager.default
-            .urls(for: .documentDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("huggingface/models/\(repo)")
-        // WhisperKit fuzzy-matches variant folder names on download, so
-        // accept any non-empty folder whose name contains the variant.
-        let candidates = (try? FileManager.default.contentsOfDirectory(atPath: repoDir.path)) ?? []
-        let found = candidates.contains { $0.contains(variant) && directoryNonEmpty(repoDir.appendingPathComponent($0).path) }
-        if found {
+        let cached = ModelCache.cachedVariantDirectory(
+            base: ModelCache.base(for: model),
+            repo: model.repoID,
+            variant: variant
+        )
+        if cached != nil {
             return Check(name: name, status: .ok, remediation: nil)
         }
         return Check(

@@ -38,6 +38,13 @@ First run downloads three models (~1 GB total): multilingual `whisper-tiny` for
 language identification, [`nb-whisper-small`](https://huggingface.co/Barrymanalow/nb-whisper-coreml)
 for Norwegian, and `whisper-small.en` for English. No account or token needed.
 
+Models are cached in `~/Library/Application Support/parrot/models`. Versions up
+to v0.3.0 used `~/Documents/huggingface` instead — WhisperKit's default — which
+iCloud syncs and evicts if you have "Desktop & Documents Folders" turned on;
+evicted weights break bilingual warm-up with *Resource deadlock avoided*
+(#34). Your existing cache keeps working where it is; `parrot models migrate`
+moves it, and `parrot doctor` warns when it needs moving.
+
 ### A note on the unsigned binary
 
 Releases are unsigned and un-notarized. The `curl` command above is unaffected —
@@ -127,6 +134,7 @@ parrot doctor                          # check permissions + fn key setting
 parrot models list                     # list available models
 parrot models download <id>            # pre-download a model
 parrot models download bilingual       # pre-download the bilingual model set
+parrot models migrate                  # move a pre-v0.3.1 cache out of ~/Documents
 parrot --model whisper-large-v3-turbo  # bigger, multilingual, slower first-run
 parrot --bilingual                     # per-utterance Norwegian/English routing
 parrot --bilingual --en-model whisper-base.en --en-threshold 0.7   # tweak routes
