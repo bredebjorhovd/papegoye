@@ -80,15 +80,30 @@ for the design). Check items off as they land; add follow-ups at the bottom.
 - [ ] Manual: 20 mixed utterances into a text field — ≥ 18 routed correctly,
       **zero** stock-Whisper-on-Norwegian outputs
 - [ ] Latency: LID ≤ 30 ms on ANE for ≤ 10 s utterance (read from `◐ lid` logs)
-      — **still open, but the 66-89 ms that opened gh#20 does not reproduce.**
-      `parrot bench lid --durations 1,2,5,10,30 --signals all --stages`
-      (2026-07-31): release build **15.4 ms median, PASS**; the same sweep from
-      a `swift build` debug binary gives ~52 ms, FAIL. The CoreML encoder costs
-      6.1-6.2 ms in both — only the Swift half of the call changes. Latency is
-      a fixed cost (1.17× spread over 30× utterance length), so a shorter LID
-      window buys nothing: WhisperKit pads back to the model's own 30 s window.
-      Default window left unchanged. Closing this needs a live release-build
-      run with a microphone, plus powermetrics for the "on ANE" half.
+      — **open and FAILING, now reproducibly.** ~52 ms against a 30 ms budget.
+      - `parrot bench lid` (2026-07-31, gh#20): release build 15.4 ms median,
+        PASS; the same sweep from a `swift build` debug binary gives ~52 ms.
+        The CoreML encoder costs 6.1-6.2 ms in both — only the Swift half of
+        the call changes. Latency is a fixed cost (1.17× spread over 30×
+        utterance length), so a shorter LID window buys nothing: WhisperKit
+        pads back to the model's own 30 s window. Default window unchanged.
+      - `parrot bench lid --arms all --gap 10 --observed 52` (2026-08-12,
+        gh#25): that PASS did not survive contact with the daemon, and the
+        bench now says why. **The cost is the time since the previous LID
+        call**, not resident models and not the call path. Back to back LID is
+        ~20 ms; with 10 s of idle in front of each call it is ~52 ms, matching
+        the live daemon's 46-74 ms from synthetic audio alone. Holding all
+        three models resident costs 0.9 ms (3% of the gap) and the daemon's
+        call path is below run-to-run spread — so **the ANE-contention
+        hypothesis is not supported**, and it is not an argument against the
+        memory item or a third route.
+      - Still needs a mic (capture teardown is the one gh#25 candidate the
+        bench cannot reach) and powermetrics for the "on ANE" half. The
+        mechanism behind the idle cost — ANE clock ramp, cache eviction, or
+        CoreML re-entry — is not distinguishable from wall-clock timings.
+      - Lead for a fix, not done here: the daemon knows the user is recording
+        before it needs LID, so a keep-alive call on hotkey-down would land
+        the pipeline in its ~20 ms state by the time recording stops.
 - [ ] Latency: total routing overhead ≤ 80 ms p50 vs single-model parrot
 - [x] Startup: three-model warm start ≤ 1.5× current single-model warm start —
       **1.31×, PASS** (`parrot bench warmup --iterations 3`, release build,
@@ -101,7 +116,10 @@ for the design). Check items off as they land; add follow-ups at the bottom.
       quote the build, or the number is not an acceptance result. Debug
       flattered the ratio here rather than hurting it.)
 - [ ] Memory: confirm ~1 GB resident is acceptable; else fall back to
-      `--en-model whisper-base.en` and document
+      `--en-model whisper-base.en` and document. gh#25 settles one half of
+      this: holding all three models resident costs the LID pass 0.9 ms, so
+      **latency is not an argument for shrinking the resident set** — decide
+      this on memory alone.
 - [ ] Verify NB-Whisper silence output is caught by `sanitize()` on real
       silence captures; extend patterns if new markers show up
 

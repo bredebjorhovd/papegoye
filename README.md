@@ -230,6 +230,7 @@ parrot --input-device "Shure MV7"      # record from a specific microphone
 parrot --input-device default          # record from the system default, Bluetooth and all
 parrot bench warmup                    # time single-model vs bilingual startup
 parrot bench lid                       # time language detection across utterance lengths
+parrot bench lid --arms all --gap 10   # ...with the daemon's models resident and calls spaced
 ```
 
 ## Stack
