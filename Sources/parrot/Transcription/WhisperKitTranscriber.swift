@@ -43,15 +43,26 @@ actor WhisperKitTranscriber: Transcriber {
         if pipeline == nil { try await warmUp() }
         guard let pipeline else { throw TranscriberError.notLoaded }
 
-        var options: DecodingOptions?
-        if let language {
-            options = DecodingOptions(
-                task: .transcribe,
-                language: language,
-                temperature: 0,
-                detectLanguage: false
-            )
-        }
+        // `language` stays nil for English-only models — they take no language
+        // token, and WhisperKit's own defaults for the rest of this match what
+        // we spell out here.
+        //
+        // chunkingStrategy is the load-bearing part (gh#27). Left nil, WhisperKit
+        // decodes a >30 s utterance with its own sequential seek loop, and on the
+        // NB route that loop silently drops a contiguous block out of the middle:
+        // a 78.9 s Norwegian dictation lost five to six consecutive sentences
+        // (95 of 166 words in one run), with no marker in the output and nothing
+        // in the log. `.vad` splits on silence instead and kept all 14 sentences.
+        // Not a latency trade — on nb-whisper-small it costs +5 ms at 5 s and
+        // +41 ms at 17 s (both inside run-to-run noise) and is *faster* from 33 s
+        // up. See LongUtteranceTests.
+        let options = DecodingOptions(
+            task: .transcribe,
+            language: language,
+            temperature: 0,
+            detectLanguage: false,
+            chunkingStrategy: .vad
+        )
         let results = try await pipeline.transcribe(audioArray: audio, decodeOptions: options)
         let raw = results.map(\.text).joined(separator: " ")
         return Self.sanitize(raw)
